@@ -98,6 +98,9 @@ Token Lexer::ReadIdentOrKeyword() {
   if (text == "int") {
     return {TokenKind::Int, text};
   }
+  if (text == "void") {
+    return {TokenKind::Void, text};
+  }
   if (text == "return") {
     return {TokenKind::Return, text};
   }

@@ -6,18 +6,86 @@
 Parser::Parser(std::vector<Token> tokens) : tokens_(std::move(tokens)) {}
 
 std::unique_ptr<Program> Parser::ParseCompUnit() {
-  Expect(TokenKind::Int, "'int'");
-  const Token ident = Expect(TokenKind::Ident, "function name");
-  if (ident.text != "main") {
-    throw std::runtime_error("Lv5 only supports function 'main'");
-  }
-  Expect(TokenKind::LParen, "'('");
-  Expect(TokenKind::RParen, "')'");
-
   auto program = std::make_unique<Program>();
-  program->block = ParseBlock();
+  while (Peek().kind != TokenKind::End) {
+    program->items.push_back(ParseGlobalItem());
+  }
   Expect(TokenKind::End, "end of file");
   return program;
+}
+
+TypeKind Parser::ParseFuncType() {
+  if (Match(TokenKind::Int)) {
+    return TypeKind::Int;
+  }
+  if (Match(TokenKind::Void)) {
+    return TypeKind::Void;
+  }
+  throw std::runtime_error("expected function type, got '" + Peek().text + "'");
+}
+
+GlobalItem Parser::ParseGlobalItem() {
+  if (Peek().kind == TokenKind::Const) {
+    BlockItem decl = ParseConstDecl();
+    GlobalItem item;
+    item.kind = GlobalItem::Kind::ConstDecl;
+    item.const_defs = std::move(decl.const_defs);
+    return item;
+  }
+  return ParseTopLevelDeclOrFunc();
+}
+
+GlobalItem Parser::ParseTopLevelDeclOrFunc() {
+  const TypeKind type = ParseFuncType();
+  const std::string name = Expect(TokenKind::Ident, "identifier").text;
+  if (Match(TokenKind::LParen)) {
+    GlobalItem item;
+    item.kind = GlobalItem::Kind::FuncDef;
+    item.function = ParseFuncDef(type, name);
+    return item;
+  }
+  if (type != TypeKind::Int) {
+    throw std::runtime_error("global variable must have int type");
+  }
+  BlockItem decl = ParseVarDecl(true, name);
+  GlobalItem item;
+  item.kind = GlobalItem::Kind::VarDecl;
+  item.var_defs = std::move(decl.var_defs);
+  return item;
+}
+
+std::unique_ptr<FunctionDef> Parser::ParseFuncDef(TypeKind return_type,
+                                                  std::string name) {
+  auto function = std::make_unique<FunctionDef>();
+  function->return_type = return_type;
+  function->name = std::move(name);
+  if (Peek().kind != TokenKind::RParen) {
+    function->params = ParseFuncFParams();
+  }
+  Expect(TokenKind::RParen, "')'");
+  function->block = ParseBlock();
+  return function;
+}
+
+std::vector<Param> Parser::ParseFuncFParams() {
+  std::vector<Param> params;
+  while (true) {
+    Expect(TokenKind::Int, "'int'");
+    params.push_back(Param{Expect(TokenKind::Ident, "parameter name").text});
+    if (!Match(TokenKind::Comma)) {
+      return params;
+    }
+  }
+}
+
+std::vector<std::unique_ptr<Expr>> Parser::ParseFuncRParams() {
+  std::vector<std::unique_ptr<Expr>> args;
+  while (true) {
+    args.push_back(ParseExp());
+    if (!Match(TokenKind::Comma)) {
+      return args;
+    }
+  }
 }
 
 std::unique_ptr<Block> Parser::ParseBlock() {
@@ -59,13 +127,21 @@ BlockItem Parser::ParseConstDecl() {
   return item;
 }
 
-BlockItem Parser::ParseVarDecl() {
+BlockItem Parser::ParseVarDecl(bool type_consumed, std::string first_name) {
   BlockItem item;
   item.kind = BlockItem::Kind::VarDecl;
-  Expect(TokenKind::Int, "'int'");
+  if (!type_consumed) {
+    Expect(TokenKind::Int, "'int'");
+  }
+  bool first = true;
   while (true) {
     VarDef def;
-    def.name = Expect(TokenKind::Ident, "variable name").text;
+    if (first && !first_name.empty()) {
+      def.name = std::move(first_name);
+    } else {
+      def.name = Expect(TokenKind::Ident, "variable name").text;
+    }
+    first = false;
     if (Match(TokenKind::Assign)) {
       def.init = ParseExp();
     }
@@ -82,7 +158,9 @@ BlockItem Parser::ParseStmt() {
   BlockItem item;
   if (Match(TokenKind::Return)) {
     item.kind = BlockItem::Kind::Return;
-    item.expr = ParseExp();
+    if (Peek().kind != TokenKind::Semicolon) {
+      item.expr = ParseExp();
+    }
     Expect(TokenKind::Semicolon, "';'");
     return item;
   }
@@ -229,6 +307,16 @@ std::unique_ptr<Expr> Parser::ParseMulExp() {
 }
 
 std::unique_ptr<Expr> Parser::ParseUnaryExp() {
+  if (Peek().kind == TokenKind::Ident && Peek(1).kind == TokenKind::LParen) {
+    const std::string name = Expect(TokenKind::Ident, "function name").text;
+    Expect(TokenKind::LParen, "'('");
+    std::vector<std::unique_ptr<Expr>> args;
+    if (Peek().kind != TokenKind::RParen) {
+      args = ParseFuncRParams();
+    }
+    Expect(TokenKind::RParen, "')'");
+    return std::make_unique<CallExpr>(name, std::move(args));
+  }
   if (Match(TokenKind::Plus)) {
     return std::make_unique<UnaryExpr>(UnaryOp::Plus, ParseUnaryExp());
   }

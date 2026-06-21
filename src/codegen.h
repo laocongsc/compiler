@@ -11,10 +11,17 @@ struct Symbol {
   enum class Kind {
     Const,
     Var,
+    GlobalVar,
   } kind;
   int const_value = 0;
   std::string ir_name;
+  std::string asm_name;
   int stack_offset = 0;
+};
+
+struct FuncInfo {
+  TypeKind return_type = TypeKind::Int;
+  int param_count = 0;
 };
 
 class KoopaGenerator {
@@ -24,6 +31,12 @@ class KoopaGenerator {
   void Generate(const Program &program);
 
  private:
+  void RegisterLibraryFunctions();
+  void RegisterFunctions(const Program &program);
+  void GenerateGlobalItem(const GlobalItem &item);
+  void GenerateFunction(const FunctionDef &function);
+  void ResetFunctionState();
+  void CollectAllocs(const FunctionDef &function);
   void CollectAllocs(const Block &block);
   void CollectAllocs(const BlockItem &item);
   void CollectLogicTemps(const Expr &expr);
@@ -45,16 +58,20 @@ class KoopaGenerator {
   std::string NewValueName();
   std::string NewAllocName(const std::string &hint);
   std::string NewBlockName(const std::string &hint);
+  static std::string JoinArgs(const std::vector<std::string> &args);
 
   std::ostream &out_;
   std::vector<std::unordered_map<std::string, Symbol>> scopes_;
+  std::unordered_map<std::string, FuncInfo> functions_;
   std::unordered_map<const VarDef *, std::string> var_alloc_names_;
+  std::unordered_map<const Param *, std::string> param_alloc_names_;
   std::unordered_map<const BinaryExpr *, std::string> logic_alloc_names_;
   std::vector<std::string> alloc_lines_;
   int next_value_id_ = 0;
   int next_alloc_id_ = 0;
   int next_block_id_ = 0;
   bool entry_terminated_ = false;
+  TypeKind current_return_type_ = TypeKind::Int;
   std::vector<std::string> loop_entry_labels_;
   std::vector<std::string> loop_end_labels_;
 };
@@ -66,12 +83,15 @@ class RiscvGenerator {
   void Generate(const Program &program);
 
  private:
+  void RegisterLibraryFunctions();
+  void RegisterFunctions(const Program &program);
+  void GenerateGlobalItem(const GlobalItem &item);
+  void GenerateFunction(const FunctionDef &function);
+  void ResetFunctionState();
+  void ScanFunction(const FunctionDef &function);
   void ScanBlock(const Block &block);
   void ScanItem(const BlockItem &item);
   void ScanExpr(const Expr &expr, int depth);
-  void CollectAllocs(const Block &block);
-  void CollectAllocs(const BlockItem &item);
-  void CollectLogicTemps(const Expr &expr);
   void GenerateBlock(const Block &block);
   void GenerateItem(const BlockItem &item);
   void GenerateIf(const BlockItem &item);
@@ -89,16 +109,24 @@ class RiscvGenerator {
   const Symbol &LookupSymbol(const std::string &name) const;
   int TempOffset(int depth) const;
   void EmitStackAdjust(int bytes);
+  void EmitReturn();
+  void StoreToSymbol(const Symbol &symbol, const std::string &reg);
+  void LoadFromSymbol(const Symbol &symbol, const std::string &reg);
   std::string NewLabel(const std::string &hint);
   static int AlignTo16(int bytes);
 
   std::ostream &out_;
   std::vector<std::unordered_map<std::string, Symbol>> scopes_;
+  std::unordered_map<std::string, FuncInfo> functions_;
   int next_var_offset_ = 0;
+  int local_bytes_ = 0;
+  int out_arg_bytes_ = 0;
   int max_temp_depth_ = 0;
   int frame_size_ = 0;
+  bool needs_ra_ = false;
   int next_label_id_ = 0;
   bool current_terminated_ = false;
+  TypeKind current_return_type_ = TypeKind::Int;
   std::vector<std::string> loop_entry_labels_;
   std::vector<std::string> loop_end_labels_;
 };

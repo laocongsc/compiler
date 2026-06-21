@@ -14,10 +14,18 @@ class Parser {
   std::unique_ptr<Program> ParseCompUnit();
 
  private:
+  TypeKind ParseFuncType();
+  GlobalItem ParseGlobalItem();
+  GlobalItem ParseTopLevelDeclOrFunc();
+  std::unique_ptr<FunctionDef> ParseFuncDef(TypeKind return_type,
+                                            std::string name);
+  std::vector<Param> ParseFuncFParams();
+  std::vector<std::unique_ptr<Expr>> ParseFuncRParams();
   std::unique_ptr<Block> ParseBlock();
   BlockItem ParseBlockItem();
   BlockItem ParseConstDecl();
-  BlockItem ParseVarDecl();
+  BlockItem ParseVarDecl(bool type_consumed = false,
+                         std::string first_name = "");
   BlockItem ParseStmt();
 
   std::unique_ptr<Expr> ParseExp();

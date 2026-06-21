@@ -10,6 +10,7 @@ enum class TokenKind {
   Break,
   Continue,
   Int,
+  Void,
   Return,
   Ident,
   Number,
