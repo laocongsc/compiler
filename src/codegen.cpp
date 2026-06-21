@@ -1202,6 +1202,7 @@ void RiscvGenerator::GenerateFunction(const FunctionDef &function) {
     next_var_offset_ += 4;
     symbol.dimensions = EvalDimensions(param.dimensions);
     symbol.is_pointer = param.is_array;
+    symbol.cacheable = !param.is_array;
     InsertSymbol(param.name, symbol);
     if (i < 8) {
       EmitStoreStack(out_, "a" + std::to_string(i), symbol.stack_offset);
@@ -1217,6 +1218,7 @@ void RiscvGenerator::GenerateFunction(const FunctionDef &function) {
     if (function.return_type == TypeKind::Int) {
       out_ << "  li a0, 0\n";
     }
+    FlushAndClearRegCache();
     EmitReturn();
   }
 }
@@ -1231,6 +1233,7 @@ void RiscvGenerator::ResetFunctionState() {
   current_terminated_ = false;
   loop_entry_labels_.clear();
   loop_end_labels_.clear();
+  reg_cache_.clear();
 }
 
 void RiscvGenerator::ScanFunction(const FunctionDef &function) {
@@ -1243,6 +1246,7 @@ void RiscvGenerator::ScanFunction(const FunctionDef &function) {
     next_var_offset_ += 4;
     symbol.dimensions = EvalDimensions(param.dimensions);
     symbol.is_pointer = param.is_array;
+    symbol.cacheable = !param.is_array;
     InsertSymbol(param.name, symbol);
   }
   ScanBlock(*function.block);
@@ -1413,6 +1417,7 @@ void RiscvGenerator::GenerateItem(const BlockItem &item) {
         symbol.kind = Symbol::Kind::Var;
         symbol.stack_offset = next_var_offset_;
         symbol.dimensions = dims;
+        symbol.cacheable = dims.empty();
         next_var_offset_ += dims.empty() ? 4 : TypeSize(dims);
         if (def.has_init) {
           if (dims.empty()) {
@@ -1430,6 +1435,11 @@ void RiscvGenerator::GenerateItem(const BlockItem &item) {
       if (symbol.kind == Symbol::Kind::Const) {
         throw std::runtime_error("cannot assign to constant: " + item.lval->name);
       }
+      if (item.lval->indices.empty() && symbol.dimensions.empty() && !symbol.is_pointer) {
+        GenerateExpr(*item.expr);
+        StoreToSymbol(symbol, "t0");
+        break;
+      }
       GenerateLValAddress(*item.lval);
       EmitStoreStack(out_, "t0", TempOffset(0));
       GenerateExpr(*item.expr, 1);
@@ -1442,6 +1452,7 @@ void RiscvGenerator::GenerateItem(const BlockItem &item) {
         GenerateExpr(*item.expr);
         out_ << "  mv a0, t0\n";
       }
+      FlushAndClearRegCache();
       EmitReturn();
       current_terminated_ = true;
       break;
@@ -1460,10 +1471,12 @@ void RiscvGenerator::GenerateItem(const BlockItem &item) {
       GenerateWhile(item);
       break;
     case BlockItem::Kind::Break:
+      FlushAndClearRegCache();
       out_ << "  j " << CurrentLoopEnd() << "\n";
       current_terminated_ = true;
       break;
     case BlockItem::Kind::Continue:
+      FlushAndClearRegCache();
       out_ << "  j " << CurrentLoopEntry() << "\n";
       current_terminated_ = true;
       break;
@@ -1476,19 +1489,23 @@ void RiscvGenerator::GenerateIf(const BlockItem &item) {
   const std::string else_label = item.else_stmt ? NewLabel("else") : end_label;
   GenerateCond(*item.expr, then_label, else_label);
   out_ << then_label << ":\n";
+  ClearRegCache();
   current_terminated_ = false;
   GenerateItem(*item.then_stmt);
   const bool then_terminated = current_terminated_;
   if (!then_terminated) {
+    FlushAndClearRegCache();
     out_ << "  j " << end_label << "\n";
   }
   bool else_terminated = false;
   if (item.else_stmt) {
     out_ << else_label << ":\n";
+    ClearRegCache();
     current_terminated_ = false;
     GenerateItem(*item.else_stmt);
     else_terminated = current_terminated_;
     if (!else_terminated) {
+      FlushAndClearRegCache();
       out_ << "  j " << end_label << "\n";
     }
   }
@@ -1497,6 +1514,7 @@ void RiscvGenerator::GenerateIf(const BlockItem &item) {
     return;
   }
   out_ << end_label << ":\n";
+  ClearRegCache();
   current_terminated_ = false;
 }
 
@@ -1504,11 +1522,14 @@ void RiscvGenerator::GenerateWhile(const BlockItem &item) {
   const std::string entry_label = NewLabel("while_entry");
   const std::string body_label = NewLabel("while_body");
   const std::string end_label = NewLabel("while_end");
+  FlushAndClearRegCache();
   out_ << "  j " << entry_label << "\n";
   out_ << entry_label << ":\n";
+  ClearRegCache();
   current_terminated_ = false;
   GenerateCond(*item.expr, body_label, end_label);
   out_ << body_label << ":\n";
+  ClearRegCache();
   current_terminated_ = false;
   loop_entry_labels_.push_back(entry_label);
   loop_end_labels_.push_back(end_label);
@@ -1516,9 +1537,11 @@ void RiscvGenerator::GenerateWhile(const BlockItem &item) {
   loop_entry_labels_.pop_back();
   loop_end_labels_.pop_back();
   if (!current_terminated_) {
+    FlushAndClearRegCache();
     out_ << "  j " << entry_label << "\n";
   }
   out_ << end_label << ":\n";
+  ClearRegCache();
   current_terminated_ = false;
 }
 
@@ -1545,6 +1568,8 @@ void RiscvGenerator::GenerateExpr(const Expr &expr, int depth) {
     const Symbol &symbol = LookupSymbol(lval->name);
     if (symbol.kind == Symbol::Kind::Const && symbol.dimensions.empty()) {
       out_ << "  li t0, " << symbol.const_value << "\n";
+    } else if (lval->indices.empty() && symbol.dimensions.empty() && !symbol.is_pointer) {
+      LoadFromSymbol(symbol, "t0");
     } else {
       GenerateLValAddress(*lval, depth);
       const size_t used = lval->indices.size();
@@ -1574,6 +1599,7 @@ void RiscvGenerator::GenerateExpr(const Expr &expr, int depth) {
       GenerateExpr(*call->args[i], depth + arg_count);
       EmitStoreStack(out_, "t0", TempOffset(depth + static_cast<int>(i)));
     }
+    FlushAndClearRegCache();
     for (size_t i = 0; i < call->args.size(); ++i) {
       EmitLoadStack(out_, "t0", TempOffset(depth + static_cast<int>(i)));
       if (i < 8) {
@@ -1694,6 +1720,7 @@ void RiscvGenerator::GenerateCond(const Expr &expr, const std::string &true_labe
     }
   }
   GenerateExpr(expr, depth);
+  FlushAndClearRegCache();
   out_ << "  bnez t0, " << true_label << "\n";
   out_ << "  j " << false_label << "\n";
 }
@@ -1829,6 +1856,14 @@ void RiscvGenerator::EmitReturn() {
 }
 
 void RiscvGenerator::StoreToSymbol(const Symbol &symbol, const std::string &reg) {
+  if (CanCacheSymbol(symbol)) {
+    CachedReg &cached = EnsureCachedReg(symbol);
+    if (cached.reg != reg) {
+      out_ << "  mv " << cached.reg << ", " << reg << "\n";
+    }
+    cached.dirty = true;
+    return;
+  }
   if (symbol.kind == Symbol::Kind::GlobalVar || (!symbol.asm_name.empty())) {
     out_ << "  la t1, " << symbol.asm_name << "\n";
     out_ << "  sw " << reg << ", 0(t1)\n";
@@ -1838,12 +1873,77 @@ void RiscvGenerator::StoreToSymbol(const Symbol &symbol, const std::string &reg)
 }
 
 void RiscvGenerator::LoadFromSymbol(const Symbol &symbol, const std::string &reg) {
+  if (CanCacheSymbol(symbol)) {
+    if (CachedReg *cached = FindCachedReg(symbol)) {
+      if (cached->reg != reg) {
+        out_ << "  mv " << reg << ", " << cached->reg << "\n";
+      }
+      return;
+    }
+    CachedReg &cached = EnsureCachedReg(symbol);
+    EmitLoadStack(out_, cached.reg, symbol.stack_offset);
+    if (cached.reg != reg) {
+      out_ << "  mv " << reg << ", " << cached.reg << "\n";
+    }
+    return;
+  }
   if (symbol.kind == Symbol::Kind::GlobalVar || (!symbol.asm_name.empty())) {
     out_ << "  la " << reg << ", " << symbol.asm_name << "\n";
     out_ << "  lw " << reg << ", 0(" << reg << ")\n";
   } else {
     EmitLoadStack(out_, reg, symbol.stack_offset);
   }
+}
+
+bool RiscvGenerator::CanCacheSymbol(const Symbol &symbol) const {
+  return symbol.cacheable && symbol.kind == Symbol::Kind::Var &&
+         symbol.asm_name.empty() && symbol.dimensions.empty() && !symbol.is_pointer;
+}
+
+CachedReg *RiscvGenerator::FindCachedReg(const Symbol &symbol) {
+  for (CachedReg &cached : reg_cache_) {
+    if (cached.stack_offset == symbol.stack_offset) {
+      return &cached;
+    }
+  }
+  return nullptr;
+}
+
+CachedReg &RiscvGenerator::EnsureCachedReg(const Symbol &symbol) {
+  if (CachedReg *cached = FindCachedReg(symbol)) {
+    return *cached;
+  }
+
+  static const char *kCacheRegs[] = {"t3", "t4", "t5", "t6"};
+  constexpr size_t kCacheRegCount = sizeof(kCacheRegs) / sizeof(kCacheRegs[0]);
+  if (reg_cache_.size() < kCacheRegCount) {
+    reg_cache_.push_back(CachedReg{symbol.stack_offset, kCacheRegs[reg_cache_.size()], false});
+    return reg_cache_.back();
+  }
+
+  CachedReg &victim = reg_cache_.front();
+  if (victim.dirty) {
+    EmitStoreStack(out_, victim.reg, victim.stack_offset);
+  }
+  victim.stack_offset = symbol.stack_offset;
+  victim.dirty = false;
+  return victim;
+}
+
+void RiscvGenerator::FlushRegCache() {
+  for (CachedReg &cached : reg_cache_) {
+    if (cached.dirty) {
+      EmitStoreStack(out_, cached.reg, cached.stack_offset);
+      cached.dirty = false;
+    }
+  }
+}
+
+void RiscvGenerator::ClearRegCache() { reg_cache_.clear(); }
+
+void RiscvGenerator::FlushAndClearRegCache() {
+  FlushRegCache();
+  ClearRegCache();
 }
 
 void RiscvGenerator::StoreAddressed(const std::string &addr_reg, const std::string &value_reg) {

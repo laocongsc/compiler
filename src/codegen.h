@@ -19,11 +19,18 @@ struct Symbol {
   int stack_offset = 0;
   std::vector<int> dimensions;
   bool is_pointer = false;
+  bool cacheable = false;
 };
 
 struct FuncInfo {
   TypeKind return_type = TypeKind::Int;
   int param_count = 0;
+};
+
+struct CachedReg {
+  int stack_offset = 0;
+  std::string reg;
+  bool dirty = false;
 };
 
 struct KoopaAddrInfo {
@@ -127,6 +134,12 @@ class RiscvGenerator {
   void EmitReturn();
   void StoreToSymbol(const Symbol &symbol, const std::string &reg);
   void LoadFromSymbol(const Symbol &symbol, const std::string &reg);
+  bool CanCacheSymbol(const Symbol &symbol) const;
+  CachedReg &EnsureCachedReg(const Symbol &symbol);
+  CachedReg *FindCachedReg(const Symbol &symbol);
+  void FlushRegCache();
+  void ClearRegCache();
+  void FlushAndClearRegCache();
   void StoreAddressed(const std::string &addr_reg, const std::string &value_reg);
   void LoadAddressed(const std::string &addr_reg, const std::string &value_reg);
   void LoadSymbolAddress(const Symbol &symbol, const std::string &reg);
@@ -147,6 +160,7 @@ class RiscvGenerator {
   TypeKind current_return_type_ = TypeKind::Int;
   std::vector<std::string> loop_entry_labels_;
   std::vector<std::string> loop_end_labels_;
+  std::vector<CachedReg> reg_cache_;
 };
 
 void WriteKoopa(const std::string &path, const Program &program);
