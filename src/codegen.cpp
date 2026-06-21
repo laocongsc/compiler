@@ -96,6 +96,23 @@ void KoopaGenerator::GenerateItem(const BlockItem &item) {
     case BlockItem::Kind::If:
       GenerateIf(item);
       break;
+    case BlockItem::Kind::While:
+      GenerateWhile(item);
+      break;
+    case BlockItem::Kind::Break:
+      if (loop_end_labels_.empty()) {
+        throw std::runtime_error("break outside loop");
+      }
+      out_ << "  jump " << loop_end_labels_.back() << "\n";
+      entry_terminated_ = true;
+      break;
+    case BlockItem::Kind::Continue:
+      if (loop_entry_labels_.empty()) {
+        throw std::runtime_error("continue outside loop");
+      }
+      out_ << "  jump " << loop_entry_labels_.back() << "\n";
+      entry_terminated_ = true;
+      break;
   }
 }
 
@@ -129,6 +146,31 @@ void KoopaGenerator::GenerateIf(const BlockItem &item) {
   if (item.else_stmt && then_terminated && else_terminated) {
     entry_terminated_ = true;
     return;
+  }
+
+  out_ << end_label << ":\n";
+  entry_terminated_ = false;
+}
+
+void KoopaGenerator::GenerateWhile(const BlockItem &item) {
+  const std::string entry_label = NewBlockName("while_entry");
+  const std::string body_label = NewBlockName("while_body");
+  const std::string end_label = NewBlockName("while_end");
+
+  out_ << "  jump " << entry_label << "\n";
+  out_ << entry_label << ":\n";
+  entry_terminated_ = false;
+  GenerateCond(*item.expr, body_label, end_label);
+
+  out_ << body_label << ":\n";
+  entry_terminated_ = false;
+  loop_entry_labels_.push_back(entry_label);
+  loop_end_labels_.push_back(end_label);
+  GenerateItem(*item.body_stmt);
+  loop_entry_labels_.pop_back();
+  loop_end_labels_.pop_back();
+  if (!entry_terminated_) {
+    out_ << "  jump " << entry_label << "\n";
   }
 
   out_ << end_label << ":\n";
@@ -418,6 +460,13 @@ void RiscvGenerator::ScanItem(const BlockItem &item) {
         ScanItem(*item.else_stmt);
       }
       break;
+    case BlockItem::Kind::While:
+      ScanExpr(*item.expr, 0);
+      ScanItem(*item.body_stmt);
+      break;
+    case BlockItem::Kind::Break:
+    case BlockItem::Kind::Continue:
+      break;
   }
 }
 
@@ -499,6 +548,15 @@ void RiscvGenerator::GenerateItem(const BlockItem &item) {
     case BlockItem::Kind::If:
       GenerateIf(item);
       break;
+    case BlockItem::Kind::While:
+      GenerateWhile(item);
+      break;
+    case BlockItem::Kind::Break:
+      out_ << "  j " << CurrentLoopEnd() << "\n";
+      break;
+    case BlockItem::Kind::Continue:
+      out_ << "  j " << CurrentLoopEntry() << "\n";
+      break;
   }
 }
 
@@ -520,6 +578,40 @@ void RiscvGenerator::GenerateIf(const BlockItem &item) {
   }
 
   out_ << end_label << ":\n";
+}
+
+void RiscvGenerator::GenerateWhile(const BlockItem &item) {
+  const std::string entry_label = NewLabel("while_entry");
+  const std::string body_label = NewLabel("while_body");
+  const std::string end_label = NewLabel("while_end");
+
+  out_ << "  j " << entry_label << "\n";
+  out_ << entry_label << ":\n";
+  GenerateCond(*item.expr, body_label, end_label);
+
+  out_ << body_label << ":\n";
+  loop_entry_labels_.push_back(entry_label);
+  loop_end_labels_.push_back(end_label);
+  GenerateItem(*item.body_stmt);
+  loop_entry_labels_.pop_back();
+  loop_end_labels_.pop_back();
+  out_ << "  j " << entry_label << "\n";
+
+  out_ << end_label << ":\n";
+}
+
+std::string RiscvGenerator::CurrentLoopEntry() const {
+  if (loop_entry_labels_.empty()) {
+    throw std::runtime_error("continue outside loop");
+  }
+  return loop_entry_labels_.back();
+}
+
+std::string RiscvGenerator::CurrentLoopEnd() const {
+  if (loop_end_labels_.empty()) {
+    throw std::runtime_error("break outside loop");
+  }
+  return loop_end_labels_.back();
 }
 
 void RiscvGenerator::GenerateExpr(const Expr &expr, int depth) {

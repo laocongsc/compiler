@@ -102,6 +102,24 @@ BlockItem Parser::ParseStmt() {
     }
     return item;
   }
+  if (Match(TokenKind::While)) {
+    item.kind = BlockItem::Kind::While;
+    Expect(TokenKind::LParen, "'('");
+    item.expr = ParseExp();
+    Expect(TokenKind::RParen, "')'");
+    item.body_stmt = std::make_unique<BlockItem>(ParseStmt());
+    return item;
+  }
+  if (Match(TokenKind::Break)) {
+    item.kind = BlockItem::Kind::Break;
+    Expect(TokenKind::Semicolon, "';'");
+    return item;
+  }
+  if (Match(TokenKind::Continue)) {
+    item.kind = BlockItem::Kind::Continue;
+    Expect(TokenKind::Semicolon, "';'");
+    return item;
+  }
   if (Match(TokenKind::Semicolon)) {
     item.kind = BlockItem::Kind::ExprStmt;
     return item;

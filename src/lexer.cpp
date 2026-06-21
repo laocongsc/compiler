@@ -86,6 +86,15 @@ Token Lexer::ReadIdentOrKeyword() {
   if (text == "else") {
     return {TokenKind::Else, text};
   }
+  if (text == "while") {
+    return {TokenKind::While, text};
+  }
+  if (text == "break") {
+    return {TokenKind::Break, text};
+  }
+  if (text == "continue") {
+    return {TokenKind::Continue, text};
+  }
   if (text == "int") {
     return {TokenKind::Int, text};
   }

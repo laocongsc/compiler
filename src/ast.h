@@ -76,6 +76,9 @@ struct BlockItem {
     ExprStmt,
     Block,
     If,
+    While,
+    Break,
+    Continue,
   } kind;
 
   std::vector<ConstDef> const_defs;
@@ -85,6 +88,7 @@ struct BlockItem {
   std::unique_ptr<Block> block;
   std::unique_ptr<BlockItem> then_stmt;
   std::unique_ptr<BlockItem> else_stmt;
+  std::unique_ptr<BlockItem> body_stmt;
 };
 
 struct Block {

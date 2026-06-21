@@ -27,6 +27,7 @@ class KoopaGenerator {
   void GenerateBlock(const Block &block);
   void GenerateItem(const BlockItem &item);
   void GenerateIf(const BlockItem &item);
+  void GenerateWhile(const BlockItem &item);
   std::string GenerateExpr(const Expr &expr);
   void GenerateCond(const Expr &expr, const std::string &true_label,
                     const std::string &false_label);
@@ -48,6 +49,8 @@ class KoopaGenerator {
   int next_alloc_id_ = 0;
   int next_block_id_ = 0;
   bool entry_terminated_ = false;
+  std::vector<std::string> loop_entry_labels_;
+  std::vector<std::string> loop_end_labels_;
 };
 
 class RiscvGenerator {
@@ -63,6 +66,9 @@ class RiscvGenerator {
   void GenerateBlock(const Block &block);
   void GenerateItem(const BlockItem &item);
   void GenerateIf(const BlockItem &item);
+  void GenerateWhile(const BlockItem &item);
+  std::string CurrentLoopEntry() const;
+  std::string CurrentLoopEnd() const;
   void GenerateExpr(const Expr &expr, int depth = 0);
   void GenerateCond(const Expr &expr, const std::string &true_label,
                     const std::string &false_label, int depth = 0);
@@ -83,6 +89,8 @@ class RiscvGenerator {
   int max_temp_depth_ = 0;
   int frame_size_ = 0;
   int next_label_id_ = 0;
+  std::vector<std::string> loop_entry_labels_;
+  std::vector<std::string> loop_end_labels_;
 };
 
 void WriteKoopa(const std::string &path, const Program &program);
