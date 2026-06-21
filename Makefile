@@ -1,7 +1,7 @@
 CXX = clang++
 CXXFLAGS ?= -std=c++17 -Wall -Wextra -O2
 
-SRC := src/main.cpp
+SRC := $(wildcard src/*.cpp)
 BUILD_DIR ?= .
 OUT := $(BUILD_DIR)/compiler
 
