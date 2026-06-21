@@ -9,20 +9,25 @@ std::unique_ptr<Program> Parser::ParseCompUnit() {
   Expect(TokenKind::Int, "'int'");
   const Token ident = Expect(TokenKind::Ident, "function name");
   if (ident.text != "main") {
-    throw std::runtime_error("Lv4 only supports function 'main'");
+    throw std::runtime_error("Lv5 only supports function 'main'");
   }
   Expect(TokenKind::LParen, "'('");
   Expect(TokenKind::RParen, "')'");
-  Expect(TokenKind::LBrace, "'{'");
 
   auto program = std::make_unique<Program>();
-  while (Peek().kind != TokenKind::RBrace) {
-    program->items.push_back(ParseBlockItem());
-  }
-
-  Expect(TokenKind::RBrace, "'}'");
+  program->block = ParseBlock();
   Expect(TokenKind::End, "end of file");
   return program;
+}
+
+std::unique_ptr<Block> Parser::ParseBlock() {
+  Expect(TokenKind::LBrace, "'{'");
+  auto block = std::make_unique<Block>();
+  while (Peek().kind != TokenKind::RBrace) {
+    block->items.push_back(ParseBlockItem());
+  }
+  Expect(TokenKind::RBrace, "'}'");
+  return block;
 }
 
 BlockItem Parser::ParseBlockItem() {
@@ -81,10 +86,25 @@ BlockItem Parser::ParseStmt() {
     Expect(TokenKind::Semicolon, "';'");
     return item;
   }
+  if (Peek().kind == TokenKind::LBrace) {
+    item.kind = BlockItem::Kind::Block;
+    item.block = ParseBlock();
+    return item;
+  }
+  if (Match(TokenKind::Semicolon)) {
+    item.kind = BlockItem::Kind::ExprStmt;
+    return item;
+  }
+  if (Peek().kind == TokenKind::Ident && Peek(1).kind == TokenKind::Assign) {
+    item.kind = BlockItem::Kind::Assign;
+    item.lval = Expect(TokenKind::Ident, "assignment target").text;
+    Expect(TokenKind::Assign, "'='");
+    item.expr = ParseExp();
+    Expect(TokenKind::Semicolon, "';'");
+    return item;
+  }
 
-  item.kind = BlockItem::Kind::Assign;
-  item.lval = Expect(TokenKind::Ident, "assignment target").text;
-  Expect(TokenKind::Assign, "'='");
+  item.kind = BlockItem::Kind::ExprStmt;
   item.expr = ParseExp();
   Expect(TokenKind::Semicolon, "';'");
   return item;
@@ -205,11 +225,11 @@ std::unique_ptr<Expr> Parser::ParsePrimaryExp() {
       Expect(TokenKind::Number, "integer constant, identifier or '('").value);
 }
 
-const Token &Parser::Peek() const {
-  if (pos_ >= tokens_.size()) {
+const Token &Parser::Peek(size_t offset) const {
+  if (pos_ + offset >= tokens_.size()) {
     throw std::runtime_error("unexpected end of token stream");
   }
-  return tokens_[pos_];
+  return tokens_[pos_ + offset];
 }
 
 Token Parser::Expect(TokenKind kind, const std::string &expected) {

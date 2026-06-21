@@ -3,6 +3,7 @@
 #include <iosfwd>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "ast.h"
 
@@ -23,9 +24,12 @@ class KoopaGenerator {
   void Generate(const Program &program);
 
  private:
+  void GenerateBlock(const Block &block);
   void GenerateItem(const BlockItem &item);
   std::string GenerateExpr(const Expr &expr);
   int EvalConstExpr(const Expr &expr) const;
+  void PushScope();
+  void PopScope();
   void InsertSymbol(const std::string &name, Symbol symbol);
   Symbol &LookupSymbol(const std::string &name);
   const Symbol &LookupSymbol(const std::string &name) const;
@@ -35,7 +39,7 @@ class KoopaGenerator {
   std::string NewAllocName(const std::string &hint);
 
   std::ostream &out_;
-  std::unordered_map<std::string, Symbol> symbols_;
+  std::vector<std::unordered_map<std::string, Symbol>> scopes_;
   int next_value_id_ = 0;
   int next_alloc_id_ = 0;
   bool entry_terminated_ = false;
@@ -48,11 +52,15 @@ class RiscvGenerator {
   void Generate(const Program &program);
 
  private:
-  void ScanProgram(const Program &program);
+  void ScanBlock(const Block &block);
+  void ScanItem(const BlockItem &item);
   void ScanExpr(const Expr &expr, int depth);
+  void GenerateBlock(const Block &block);
   void GenerateItem(const BlockItem &item);
   void GenerateExpr(const Expr &expr, int depth = 0);
   int EvalConstExpr(const Expr &expr) const;
+  void PushScope();
+  void PopScope();
   void InsertSymbol(const std::string &name, Symbol symbol);
   Symbol &LookupSymbol(const std::string &name);
   const Symbol &LookupSymbol(const std::string &name) const;
@@ -61,7 +69,7 @@ class RiscvGenerator {
   static int AlignTo16(int bytes);
 
   std::ostream &out_;
-  std::unordered_map<std::string, Symbol> symbols_;
+  std::vector<std::unordered_map<std::string, Symbol>> scopes_;
   int next_var_offset_ = 0;
   int max_temp_depth_ = 0;
   int frame_size_ = 0;

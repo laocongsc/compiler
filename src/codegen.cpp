@@ -3,6 +3,7 @@
 #include <fstream>
 #include <ostream>
 #include <stdexcept>
+#include <utility>
 
 namespace {
 
@@ -35,13 +36,19 @@ KoopaGenerator::KoopaGenerator(std::ostream &out) : out_(out) {}
 void KoopaGenerator::Generate(const Program &program) {
   out_ << "fun @main(): i32 {\n";
   out_ << "%entry:\n";
-  for (const BlockItem &item : program.items) {
+  GenerateBlock(*program.block);
+  out_ << "}\n";
+}
+
+void KoopaGenerator::GenerateBlock(const Block &block) {
+  PushScope();
+  for (const BlockItem &item : block.items) {
     if (entry_terminated_) {
       break;
     }
     GenerateItem(item);
   }
-  out_ << "}\n";
+  PopScope();
 }
 
 void KoopaGenerator::GenerateItem(const BlockItem &item) {
@@ -56,11 +63,11 @@ void KoopaGenerator::GenerateItem(const BlockItem &item) {
       for (const VarDef &def : item.var_defs) {
         const std::string ir_name = NewAllocName(def.name);
         out_ << "  " << ir_name << " = alloc i32\n";
-        InsertSymbol(def.name, Symbol{Symbol::Kind::Var, 0, ir_name, 0});
         if (def.init) {
           const std::string value = GenerateExpr(*def.init);
           out_ << "  store " << value << ", " << ir_name << "\n";
         }
+        InsertSymbol(def.name, Symbol{Symbol::Kind::Var, 0, ir_name, 0});
       }
       break;
     case BlockItem::Kind::Assign: {
@@ -72,10 +79,19 @@ void KoopaGenerator::GenerateItem(const BlockItem &item) {
       out_ << "  store " << value << ", " << symbol.ir_name << "\n";
       break;
     }
-    case BlockItem::Kind::Return:
+    case BlockItem::Kind::Return: {
       const std::string value = GenerateExpr(*item.expr);
       out_ << "  ret " << value << "\n";
       entry_terminated_ = true;
+      break;
+    }
+    case BlockItem::Kind::ExprStmt:
+      if (item.expr) {
+        GenerateExpr(*item.expr);
+      }
+      break;
+    case BlockItem::Kind::Block:
+      GenerateBlock(*item.block);
       break;
   }
 }
@@ -212,26 +228,37 @@ int KoopaGenerator::EvalConstExpr(const Expr &expr) const {
   throw std::runtime_error("unknown binary operator");
 }
 
+void KoopaGenerator::PushScope() { scopes_.emplace_back(); }
+
+void KoopaGenerator::PopScope() { scopes_.pop_back(); }
+
 void KoopaGenerator::InsertSymbol(const std::string &name, Symbol symbol) {
-  if (!symbols_.emplace(name, std::move(symbol)).second) {
+  if (scopes_.empty()) {
+    throw std::runtime_error("internal error: no active scope");
+  }
+  if (!scopes_.back().emplace(name, std::move(symbol)).second) {
     throw std::runtime_error("redefined symbol: " + name);
   }
 }
 
 Symbol &KoopaGenerator::LookupSymbol(const std::string &name) {
-  auto it = symbols_.find(name);
-  if (it == symbols_.end()) {
-    throw std::runtime_error("undefined symbol: " + name);
+  for (auto it = scopes_.rbegin(); it != scopes_.rend(); ++it) {
+    auto found = it->find(name);
+    if (found != it->end()) {
+      return found->second;
+    }
   }
-  return it->second;
+  throw std::runtime_error("undefined symbol: " + name);
 }
 
 const Symbol &KoopaGenerator::LookupSymbol(const std::string &name) const {
-  auto it = symbols_.find(name);
-  if (it == symbols_.end()) {
-    throw std::runtime_error("undefined symbol: " + name);
+  for (auto it = scopes_.rbegin(); it != scopes_.rend(); ++it) {
+    auto found = it->find(name);
+    if (found != it->end()) {
+      return found->second;
+    }
   }
-  return it->second;
+  throw std::runtime_error("undefined symbol: " + name);
 }
 
 std::string KoopaGenerator::EmitBinary(const std::string &op,
@@ -253,48 +280,67 @@ std::string KoopaGenerator::NewAllocName(const std::string &hint) {
 RiscvGenerator::RiscvGenerator(std::ostream &out) : out_(out) {}
 
 void RiscvGenerator::Generate(const Program &program) {
-  ScanProgram(program);
+  ScanBlock(*program.block);
+  frame_size_ = AlignTo16(next_var_offset_ + max_temp_depth_ * 4);
+
+  scopes_.clear();
+  next_var_offset_ = 0;
 
   out_ << "  .text\n";
   out_ << "  .globl main\n";
   out_ << "main:\n";
   EmitStackAdjust(-frame_size_);
-  for (const BlockItem &item : program.items) {
-    GenerateItem(item);
-  }
+  GenerateBlock(*program.block);
 }
 
-void RiscvGenerator::ScanProgram(const Program &program) {
-  for (const BlockItem &item : program.items) {
-    switch (item.kind) {
-      case BlockItem::Kind::ConstDecl:
-        for (const ConstDef &def : item.const_defs) {
-          InsertSymbol(def.name,
-                       Symbol{Symbol::Kind::Const, EvalConstExpr(*def.init), "", 0});
-        }
-        break;
-      case BlockItem::Kind::VarDecl:
-        for (const VarDef &def : item.var_defs) {
-          if (def.init) {
-            ScanExpr(*def.init, 0);
-          }
-          Symbol symbol;
-          symbol.kind = Symbol::Kind::Var;
-          symbol.stack_offset = next_var_offset_;
-          next_var_offset_ += 4;
-          InsertSymbol(def.name, symbol);
-        }
-        break;
-      case BlockItem::Kind::Assign:
-        LookupSymbol(item.lval);
-        ScanExpr(*item.expr, 0);
-        break;
-      case BlockItem::Kind::Return:
-        ScanExpr(*item.expr, 0);
-        break;
-    }
+void RiscvGenerator::ScanBlock(const Block &block) {
+  PushScope();
+  for (const BlockItem &item : block.items) {
+    ScanItem(item);
   }
-  frame_size_ = AlignTo16(next_var_offset_ + max_temp_depth_ * 4);
+  PopScope();
+}
+
+void RiscvGenerator::ScanItem(const BlockItem &item) {
+  switch (item.kind) {
+    case BlockItem::Kind::ConstDecl:
+      for (const ConstDef &def : item.const_defs) {
+        InsertSymbol(def.name,
+                     Symbol{Symbol::Kind::Const, EvalConstExpr(*def.init), "", 0});
+      }
+      break;
+    case BlockItem::Kind::VarDecl:
+      for (const VarDef &def : item.var_defs) {
+        if (def.init) {
+          ScanExpr(*def.init, 0);
+        }
+        Symbol symbol;
+        symbol.kind = Symbol::Kind::Var;
+        symbol.stack_offset = next_var_offset_;
+        next_var_offset_ += 4;
+        InsertSymbol(def.name, symbol);
+      }
+      break;
+    case BlockItem::Kind::Assign: {
+      const Symbol &symbol = LookupSymbol(item.lval);
+      if (symbol.kind != Symbol::Kind::Var) {
+        throw std::runtime_error("cannot assign to constant: " + item.lval);
+      }
+      ScanExpr(*item.expr, 0);
+      break;
+    }
+    case BlockItem::Kind::Return:
+      ScanExpr(*item.expr, 0);
+      break;
+    case BlockItem::Kind::ExprStmt:
+      if (item.expr) {
+        ScanExpr(*item.expr, 0);
+      }
+      break;
+    case BlockItem::Kind::Block:
+      ScanBlock(*item.block);
+      break;
+  }
 }
 
 void RiscvGenerator::ScanExpr(const Expr &expr, int depth) {
@@ -320,16 +366,33 @@ void RiscvGenerator::ScanExpr(const Expr &expr, int depth) {
   ScanExpr(*binary->rhs, depth + 1);
 }
 
+void RiscvGenerator::GenerateBlock(const Block &block) {
+  PushScope();
+  for (const BlockItem &item : block.items) {
+    GenerateItem(item);
+  }
+  PopScope();
+}
+
 void RiscvGenerator::GenerateItem(const BlockItem &item) {
   switch (item.kind) {
     case BlockItem::Kind::ConstDecl:
+      for (const ConstDef &def : item.const_defs) {
+        InsertSymbol(def.name,
+                     Symbol{Symbol::Kind::Const, EvalConstExpr(*def.init), "", 0});
+      }
       break;
     case BlockItem::Kind::VarDecl:
       for (const VarDef &def : item.var_defs) {
+        Symbol symbol;
+        symbol.kind = Symbol::Kind::Var;
+        symbol.stack_offset = next_var_offset_;
+        next_var_offset_ += 4;
         if (def.init) {
           GenerateExpr(*def.init);
-          EmitStoreStack(out_, "t0", LookupSymbol(def.name).stack_offset);
+          EmitStoreStack(out_, "t0", symbol.stack_offset);
         }
+        InsertSymbol(def.name, symbol);
       }
       break;
     case BlockItem::Kind::Assign: {
@@ -346,6 +409,14 @@ void RiscvGenerator::GenerateItem(const BlockItem &item) {
       out_ << "  mv a0, t0\n";
       EmitStackAdjust(frame_size_);
       out_ << "  ret\n";
+      break;
+    case BlockItem::Kind::ExprStmt:
+      if (item.expr) {
+        GenerateExpr(*item.expr);
+      }
+      break;
+    case BlockItem::Kind::Block:
+      GenerateBlock(*item.block);
       break;
   }
 }
@@ -502,26 +573,37 @@ int RiscvGenerator::EvalConstExpr(const Expr &expr) const {
   throw std::runtime_error("unknown binary operator");
 }
 
+void RiscvGenerator::PushScope() { scopes_.emplace_back(); }
+
+void RiscvGenerator::PopScope() { scopes_.pop_back(); }
+
 void RiscvGenerator::InsertSymbol(const std::string &name, Symbol symbol) {
-  if (!symbols_.emplace(name, std::move(symbol)).second) {
+  if (scopes_.empty()) {
+    throw std::runtime_error("internal error: no active scope");
+  }
+  if (!scopes_.back().emplace(name, std::move(symbol)).second) {
     throw std::runtime_error("redefined symbol: " + name);
   }
 }
 
 Symbol &RiscvGenerator::LookupSymbol(const std::string &name) {
-  auto it = symbols_.find(name);
-  if (it == symbols_.end()) {
-    throw std::runtime_error("undefined symbol: " + name);
+  for (auto it = scopes_.rbegin(); it != scopes_.rend(); ++it) {
+    auto found = it->find(name);
+    if (found != it->end()) {
+      return found->second;
+    }
   }
-  return it->second;
+  throw std::runtime_error("undefined symbol: " + name);
 }
 
 const Symbol &RiscvGenerator::LookupSymbol(const std::string &name) const {
-  auto it = symbols_.find(name);
-  if (it == symbols_.end()) {
-    throw std::runtime_error("undefined symbol: " + name);
+  for (auto it = scopes_.rbegin(); it != scopes_.rend(); ++it) {
+    auto found = it->find(name);
+    if (found != it->end()) {
+      return found->second;
+    }
   }
-  return it->second;
+  throw std::runtime_error("undefined symbol: " + name);
 }
 
 int RiscvGenerator::TempOffset(int depth) const {
@@ -540,9 +622,7 @@ void RiscvGenerator::EmitStackAdjust(int bytes) {
   out_ << "  add sp, sp, t0\n";
 }
 
-int RiscvGenerator::AlignTo16(int bytes) {
-  return (bytes + 15) / 16 * 16;
-}
+int RiscvGenerator::AlignTo16(int bytes) { return (bytes + 15) / 16 * 16; }
 
 void WriteKoopa(const std::string &path, const Program &program) {
   std::ofstream out(path);

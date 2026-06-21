@@ -14,6 +14,7 @@ class Parser {
   std::unique_ptr<Program> ParseCompUnit();
 
  private:
+  std::unique_ptr<Block> ParseBlock();
   BlockItem ParseBlockItem();
   BlockItem ParseConstDecl();
   BlockItem ParseVarDecl();
@@ -29,7 +30,7 @@ class Parser {
   std::unique_ptr<Expr> ParseUnaryExp();
   std::unique_ptr<Expr> ParsePrimaryExp();
 
-  const Token &Peek() const;
+  const Token &Peek(size_t offset = 0) const;
   Token Expect(TokenKind kind, const std::string &expected);
   bool Match(TokenKind kind);
 

@@ -65,20 +65,29 @@ struct VarDef {
   std::unique_ptr<Expr> init;
 };
 
+struct Block;
+
 struct BlockItem {
   enum class Kind {
     ConstDecl,
     VarDecl,
     Assign,
     Return,
+    ExprStmt,
+    Block,
   } kind;
 
   std::vector<ConstDef> const_defs;
   std::vector<VarDef> var_defs;
   std::string lval;
   std::unique_ptr<Expr> expr;
+  std::unique_ptr<Block> block;
+};
+
+struct Block {
+  std::vector<BlockItem> items;
 };
 
 struct Program {
-  std::vector<BlockItem> items;
+  std::unique_ptr<Block> block;
 };
