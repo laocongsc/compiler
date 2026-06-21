@@ -3,7 +3,9 @@
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -348,6 +350,305 @@ class ConstFolder {
   std::vector<std::unordered_map<std::string, int>> scopes_;
 };
 
+
+class LocalDce {
+ public:
+  void Optimize(Program &program) {
+    CollectGlobals(program);
+    for (GlobalItem &item : program.items) {
+      if (item.kind == GlobalItem::Kind::FuncDef) {
+        OptimizeFunction(*item.function);
+      }
+    }
+  }
+
+ private:
+  void CollectGlobals(const Program &program) {
+    globals_.clear();
+    for (const GlobalItem &item : program.items) {
+      if (item.kind == GlobalItem::Kind::VarDecl) {
+        for (const VarDef &def : item.var_defs) {
+          globals_.insert(def.name);
+        }
+      }
+      if (item.kind == GlobalItem::Kind::ConstDecl) {
+        for (const ConstDef &def : item.const_defs) {
+          if (!def.dimensions.empty()) {
+            globals_.insert(def.name);
+          }
+        }
+      }
+    }
+  }
+
+  void OptimizeFunction(FunctionDef &function) {
+    OptimizeBlock(*function.block);
+  }
+
+  void OptimizeBlock(Block &block) {
+    std::unordered_set<std::string> live_vars;
+    for (auto it = block.items.rbegin(); it != block.items.rend();) {
+      BlockItem &item = *it;
+      if (CanEraseAssign(item, live_vars)) {
+        it = decltype(it)(block.items.erase(std::next(it).base()));
+        continue;
+      }
+      VisitItem(item, live_vars);
+      ++it;
+    }
+  }
+
+  bool CanEraseAssign(const BlockItem &item,
+                      const std::unordered_set<std::string> &live_vars) const {
+    if (item.kind != BlockItem::Kind::Assign || item.lval == nullptr ||
+        item.expr == nullptr) {
+      return false;
+    }
+    if (!item.lval->indices.empty()) {
+      return false;
+    }
+    if (globals_.count(item.lval->name) != 0) {
+      return false;
+    }
+    if (live_vars.count(item.lval->name) != 0) {
+      return false;
+    }
+    return !HasSideEffects(*item.expr);
+  }
+
+  void VisitItem(const BlockItem &item, std::unordered_set<std::string> &live_vars) const {
+    switch (item.kind) {
+      case BlockItem::Kind::ConstDecl:
+        for (const ConstDef &def : item.const_defs) {
+          live_vars.erase(def.name);
+          for (const auto &dimension : def.dimensions) {
+            CollectExprUses(*dimension, live_vars);
+          }
+          CollectInitUses(def.init, live_vars);
+        }
+        break;
+      case BlockItem::Kind::VarDecl:
+        for (const VarDef &def : item.var_defs) {
+          const bool var_live = live_vars.count(def.name) != 0;
+          live_vars.erase(def.name);
+          for (const auto &dimension : def.dimensions) {
+            CollectExprUses(*dimension, live_vars);
+          }
+          if (def.has_init && (var_live || InitHasSideEffects(def.init))) {
+            CollectInitUses(def.init, live_vars);
+          }
+        }
+        break;
+      case BlockItem::Kind::Assign:
+        if (item.lval != nullptr) {
+          for (const auto &index : item.lval->indices) {
+            CollectExprUses(*index, live_vars);
+          }
+          if (item.lval->indices.empty()) {
+            live_vars.erase(item.lval->name);
+          } else {
+            live_vars.insert(item.lval->name);
+          }
+        }
+        if (item.expr) {
+          CollectExprUses(*item.expr, live_vars);
+        }
+        break;
+      case BlockItem::Kind::Return:
+      case BlockItem::Kind::ExprStmt:
+        if (item.expr) {
+          CollectExprUses(*item.expr, live_vars);
+        }
+        break;
+      case BlockItem::Kind::Block:
+        if (item.block) {
+          CollectBlockUses(*item.block, live_vars);
+        }
+        break;
+      case BlockItem::Kind::If:
+        if (item.expr) {
+          CollectExprUses(*item.expr, live_vars);
+        }
+        if (item.then_stmt) {
+          CollectItemUses(*item.then_stmt, live_vars);
+        }
+        if (item.else_stmt) {
+          CollectItemUses(*item.else_stmt, live_vars);
+        }
+        break;
+      case BlockItem::Kind::While:
+        if (item.expr) {
+          CollectExprUses(*item.expr, live_vars);
+        }
+        if (item.body_stmt) {
+          CollectItemUses(*item.body_stmt, live_vars);
+        }
+        break;
+      case BlockItem::Kind::Break:
+      case BlockItem::Kind::Continue:
+        break;
+    }
+  }
+
+  static bool InitHasSideEffects(const InitVal &init) {
+    if (init.is_list) {
+      for (const InitVal &child : init.list) {
+        if (InitHasSideEffects(child)) {
+          return true;
+        }
+      }
+      return false;
+    }
+    return init.expr && HasSideEffects(*init.expr);
+  }
+
+  static bool HasSideEffects(const Expr &expr) {
+    if (dynamic_cast<const NumberExpr *>(&expr) != nullptr) {
+      return false;
+    }
+    if (const auto *lval = dynamic_cast<const LValExpr *>(&expr)) {
+      for (const auto &index : lval->indices) {
+        if (HasSideEffects(*index)) {
+          return true;
+        }
+      }
+      return false;
+    }
+    if (dynamic_cast<const CallExpr *>(&expr) != nullptr) {
+      return true;
+    }
+    if (const auto *unary = dynamic_cast<const UnaryExpr *>(&expr)) {
+      return HasSideEffects(*unary->operand);
+    }
+    const auto *binary = dynamic_cast<const BinaryExpr *>(&expr);
+    if (binary == nullptr) {
+      return true;
+    }
+    return HasSideEffects(*binary->lhs) || HasSideEffects(*binary->rhs);
+  }
+
+  static void CollectInitUses(const InitVal &init,
+                              std::unordered_set<std::string> &uses) {
+    if (init.is_list) {
+      for (const InitVal &child : init.list) {
+        CollectInitUses(child, uses);
+      }
+    } else if (init.expr) {
+      CollectExprUses(*init.expr, uses);
+    }
+  }
+
+  static void CollectExprUses(const Expr &expr,
+                              std::unordered_set<std::string> &uses) {
+    if (dynamic_cast<const NumberExpr *>(&expr) != nullptr) {
+      return;
+    }
+    if (const auto *lval = dynamic_cast<const LValExpr *>(&expr)) {
+      uses.insert(lval->name);
+      for (const auto &index : lval->indices) {
+        CollectExprUses(*index, uses);
+      }
+      return;
+    }
+    if (const auto *call = dynamic_cast<const CallExpr *>(&expr)) {
+      for (const auto &arg : call->args) {
+        CollectExprUses(*arg, uses);
+      }
+      return;
+    }
+    if (const auto *unary = dynamic_cast<const UnaryExpr *>(&expr)) {
+      CollectExprUses(*unary->operand, uses);
+      return;
+    }
+    const auto *binary = dynamic_cast<const BinaryExpr *>(&expr);
+    if (binary == nullptr) {
+      return;
+    }
+    CollectExprUses(*binary->lhs, uses);
+    CollectExprUses(*binary->rhs, uses);
+  }
+
+  static void CollectBlockUses(const Block &block,
+                               std::unordered_set<std::string> &uses) {
+    for (const BlockItem &item : block.items) {
+      CollectItemUses(item, uses);
+    }
+  }
+
+  static void CollectItemUses(const BlockItem &item,
+                              std::unordered_set<std::string> &uses) {
+    switch (item.kind) {
+      case BlockItem::Kind::ConstDecl:
+        for (const ConstDef &def : item.const_defs) {
+          for (const auto &dimension : def.dimensions) {
+            CollectExprUses(*dimension, uses);
+          }
+          CollectInitUses(def.init, uses);
+        }
+        break;
+      case BlockItem::Kind::VarDecl:
+        for (const VarDef &def : item.var_defs) {
+          for (const auto &dimension : def.dimensions) {
+            CollectExprUses(*dimension, uses);
+          }
+          if (def.has_init) {
+            CollectInitUses(def.init, uses);
+          }
+        }
+        break;
+      case BlockItem::Kind::Assign:
+        if (item.lval) {
+          uses.insert(item.lval->name);
+          for (const auto &index : item.lval->indices) {
+            CollectExprUses(*index, uses);
+          }
+        }
+        if (item.expr) {
+          CollectExprUses(*item.expr, uses);
+        }
+        break;
+      case BlockItem::Kind::Return:
+      case BlockItem::Kind::ExprStmt:
+        if (item.expr) {
+          CollectExprUses(*item.expr, uses);
+        }
+        break;
+      case BlockItem::Kind::Block:
+        if (item.block) {
+          CollectBlockUses(*item.block, uses);
+        }
+        break;
+      case BlockItem::Kind::If:
+        if (item.expr) {
+          CollectExprUses(*item.expr, uses);
+        }
+        if (item.then_stmt) {
+          CollectItemUses(*item.then_stmt, uses);
+        }
+        if (item.else_stmt) {
+          CollectItemUses(*item.else_stmt, uses);
+        }
+        break;
+      case BlockItem::Kind::While:
+        if (item.expr) {
+          CollectExprUses(*item.expr, uses);
+        }
+        if (item.body_stmt) {
+          CollectItemUses(*item.body_stmt, uses);
+        }
+        break;
+      case BlockItem::Kind::Break:
+      case BlockItem::Kind::Continue:
+        break;
+    }
+  }
+
+  std::unordered_set<std::string> globals_;
+};
+
 }  // namespace
 
-void OptimizeAst(Program &program) { ConstFolder().Optimize(program); }
+void OptimizeAst(Program &program) {
+  ConstFolder().Optimize(program);
+  LocalDce().Optimize(program);
+}
