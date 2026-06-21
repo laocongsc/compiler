@@ -5,6 +5,7 @@
 #include <functional>
 #include <numeric>
 #include <ostream>
+#include <sstream>
 #include <stdexcept>
 #include <utility>
 
@@ -146,6 +147,130 @@ Symbol GlobalScalarSymbol(const std::string &name) {
   symbol.ir_name = "@" + name;
   symbol.asm_name = name;
   return symbol;
+}
+
+
+std::string TrimLeft(std::string line) {
+  const size_t first = line.find_first_not_of(" \t");
+  if (first == std::string::npos) {
+    return "";
+  }
+  return line.substr(first);
+}
+
+bool IsLabelLine(const std::string &line, std::string *label = nullptr) {
+  const std::string trimmed = TrimLeft(line);
+  if (trimmed.empty() || (trimmed[0] == '.' && trimmed.rfind(".globl", 0) == 0)) {
+    return false;
+  }
+  if (trimmed.back() != ':') {
+    return false;
+  }
+  const std::string name = trimmed.substr(0, trimmed.size() - 1);
+  if (name.empty() || name.find(' ') != std::string::npos ||
+      name.find('\t') != std::string::npos) {
+    return false;
+  }
+  if (label != nullptr) {
+    *label = name;
+  }
+  return true;
+}
+
+bool ParseJump(const std::string &line, std::string *target) {
+  const std::string trimmed = TrimLeft(line);
+  constexpr const char *prefix = "j ";
+  if (trimmed.rfind(prefix, 0) != 0) {
+    return false;
+  }
+  const std::string rest = trimmed.substr(2);
+  if (rest.empty() || rest.find_first_of(" \t,") != std::string::npos) {
+    return false;
+  }
+  *target = rest;
+  return true;
+}
+
+bool ParseLoadStore(const std::string &line, std::string *op,
+                    std::string *reg, std::string *addr) {
+  const std::string trimmed = TrimLeft(line);
+  if (trimmed.rfind("lw ", 0) != 0 && trimmed.rfind("sw ", 0) != 0) {
+    return false;
+  }
+  const size_t comma = trimmed.find(',');
+  if (comma == std::string::npos) {
+    return false;
+  }
+  *op = trimmed.substr(0, 2);
+  *reg = trimmed.substr(3, comma - 3);
+  size_t addr_start = comma + 1;
+  while (addr_start < trimmed.size() && std::isspace(static_cast<unsigned char>(trimmed[addr_start]))) {
+    ++addr_start;
+  }
+  *addr = trimmed.substr(addr_start);
+  return !reg->empty() && !addr->empty();
+}
+
+std::string OptimizeAsm(const std::string &asm_text) {
+  std::vector<std::string> lines;
+  std::istringstream in(asm_text);
+  std::string line;
+  while (std::getline(in, line)) {
+    lines.push_back(line);
+  }
+
+  std::vector<std::string> optimized;
+  optimized.reserve(lines.size());
+  for (size_t i = 0; i < lines.size(); ++i) {
+    std::string jump_target;
+    std::string next_label;
+    if (i + 1 < lines.size() && ParseJump(lines[i], &jump_target) &&
+        IsLabelLine(lines[i + 1], &next_label) && jump_target == next_label) {
+      continue;
+    }
+
+    std::string op;
+    std::string reg;
+    std::string addr;
+    if (ParseLoadStore(lines[i], &op, &reg, &addr) && op == "lw" &&
+        !optimized.empty()) {
+      std::string prev_op;
+      std::string prev_reg;
+      std::string prev_addr;
+      if (ParseLoadStore(optimized.back(), &prev_op, &prev_reg, &prev_addr) &&
+          prev_op == "sw" && prev_addr == addr) {
+        if (prev_reg == reg) {
+          continue;
+        }
+        optimized.push_back("  mv " + reg + ", " + prev_reg);
+        continue;
+      }
+    }
+
+    const std::string trimmed = TrimLeft(lines[i]);
+    if (trimmed.rfind("mv ", 0) == 0) {
+      const size_t comma = trimmed.find(',');
+      if (comma != std::string::npos) {
+        const std::string dst = trimmed.substr(3, comma - 3);
+        size_t src_start = comma + 1;
+        while (src_start < trimmed.size() &&
+               std::isspace(static_cast<unsigned char>(trimmed[src_start]))) {
+          ++src_start;
+        }
+        if (dst == trimmed.substr(src_start)) {
+          continue;
+        }
+      }
+    }
+
+    optimized.push_back(lines[i]);
+  }
+
+  std::ostringstream out;
+  for (const std::string &optimized_line : optimized) {
+    out << optimized_line << '\n';
+  }
+  return out.str();
 }
 
 }  // namespace
@@ -1758,10 +1883,13 @@ void WriteKoopa(const std::string &path, const Program &program) {
 }
 
 void WriteRiscv(const std::string &path, const Program &program) {
+  std::ostringstream buffer;
+  RiscvGenerator generator(buffer);
+  generator.Generate(program);
+
   std::ofstream out(path);
   if (!out) {
     throw std::runtime_error("failed to open output file: " + path);
   }
-  RiscvGenerator generator(out);
-  generator.Generate(program);
+  out << OptimizeAsm(buffer.str());
 }
