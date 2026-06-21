@@ -89,6 +89,7 @@ class RiscvGenerator {
   int max_temp_depth_ = 0;
   int frame_size_ = 0;
   int next_label_id_ = 0;
+  bool current_terminated_ = false;
   std::vector<std::string> loop_entry_labels_;
   std::vector<std::string> loop_end_labels_;
 };

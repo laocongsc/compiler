@@ -496,6 +496,9 @@ void RiscvGenerator::ScanExpr(const Expr &expr, int depth) {
 void RiscvGenerator::GenerateBlock(const Block &block) {
   PushScope();
   for (const BlockItem &item : block.items) {
+    if (current_terminated_) {
+      break;
+    }
     GenerateItem(item);
   }
   PopScope();
@@ -536,6 +539,7 @@ void RiscvGenerator::GenerateItem(const BlockItem &item) {
       out_ << "  mv a0, t0\n";
       EmitStackAdjust(frame_size_);
       out_ << "  ret\n";
+      current_terminated_ = true;
       break;
     case BlockItem::Kind::ExprStmt:
       if (item.expr) {
@@ -553,9 +557,11 @@ void RiscvGenerator::GenerateItem(const BlockItem &item) {
       break;
     case BlockItem::Kind::Break:
       out_ << "  j " << CurrentLoopEnd() << "\n";
+      current_terminated_ = true;
       break;
     case BlockItem::Kind::Continue:
       out_ << "  j " << CurrentLoopEntry() << "\n";
+      current_terminated_ = true;
       break;
   }
 }
@@ -568,16 +574,31 @@ void RiscvGenerator::GenerateIf(const BlockItem &item) {
   GenerateCond(*item.expr, then_label, else_label);
 
   out_ << then_label << ":\n";
+  current_terminated_ = false;
   GenerateItem(*item.then_stmt);
-  out_ << "  j " << end_label << "\n";
-
-  if (item.else_stmt) {
-    out_ << else_label << ":\n";
-    GenerateItem(*item.else_stmt);
+  const bool then_terminated = current_terminated_;
+  if (!then_terminated) {
     out_ << "  j " << end_label << "\n";
   }
 
+  bool else_terminated = false;
+  if (item.else_stmt) {
+    out_ << else_label << ":\n";
+    current_terminated_ = false;
+    GenerateItem(*item.else_stmt);
+    else_terminated = current_terminated_;
+    if (!else_terminated) {
+      out_ << "  j " << end_label << "\n";
+    }
+  }
+
+  if (item.else_stmt && then_terminated && else_terminated) {
+    current_terminated_ = true;
+    return;
+  }
+
   out_ << end_label << ":\n";
+  current_terminated_ = false;
 }
 
 void RiscvGenerator::GenerateWhile(const BlockItem &item) {
@@ -587,17 +608,22 @@ void RiscvGenerator::GenerateWhile(const BlockItem &item) {
 
   out_ << "  j " << entry_label << "\n";
   out_ << entry_label << ":\n";
+  current_terminated_ = false;
   GenerateCond(*item.expr, body_label, end_label);
 
   out_ << body_label << ":\n";
+  current_terminated_ = false;
   loop_entry_labels_.push_back(entry_label);
   loop_end_labels_.push_back(end_label);
   GenerateItem(*item.body_stmt);
   loop_entry_labels_.pop_back();
   loop_end_labels_.pop_back();
-  out_ << "  j " << entry_label << "\n";
+  if (!current_terminated_) {
+    out_ << "  j " << entry_label << "\n";
+  }
 
   out_ << end_label << ":\n";
+  current_terminated_ = false;
 }
 
 std::string RiscvGenerator::CurrentLoopEntry() const {
