@@ -80,6 +80,12 @@ Token Lexer::ReadIdentOrKeyword() {
   if (text == "const") {
     return {TokenKind::Const, text};
   }
+  if (text == "if") {
+    return {TokenKind::If, text};
+  }
+  if (text == "else") {
+    return {TokenKind::Else, text};
+  }
   if (text == "int") {
     return {TokenKind::Int, text};
   }

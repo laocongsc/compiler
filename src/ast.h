@@ -75,6 +75,7 @@ struct BlockItem {
     Return,
     ExprStmt,
     Block,
+    If,
   } kind;
 
   std::vector<ConstDef> const_defs;
@@ -82,6 +83,8 @@ struct BlockItem {
   std::string lval;
   std::unique_ptr<Expr> expr;
   std::unique_ptr<Block> block;
+  std::unique_ptr<BlockItem> then_stmt;
+  std::unique_ptr<BlockItem> else_stmt;
 };
 
 struct Block {

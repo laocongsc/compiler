@@ -4,6 +4,8 @@
 
 enum class TokenKind {
   Const,
+  If,
+  Else,
   Int,
   Return,
   Ident,

@@ -91,6 +91,17 @@ BlockItem Parser::ParseStmt() {
     item.block = ParseBlock();
     return item;
   }
+  if (Match(TokenKind::If)) {
+    item.kind = BlockItem::Kind::If;
+    Expect(TokenKind::LParen, "'('");
+    item.expr = ParseExp();
+    Expect(TokenKind::RParen, "')'");
+    item.then_stmt = std::make_unique<BlockItem>(ParseStmt());
+    if (Match(TokenKind::Else)) {
+      item.else_stmt = std::make_unique<BlockItem>(ParseStmt());
+    }
+    return item;
+  }
   if (Match(TokenKind::Semicolon)) {
     item.kind = BlockItem::Kind::ExprStmt;
     return item;

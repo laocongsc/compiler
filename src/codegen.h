@@ -26,7 +26,10 @@ class KoopaGenerator {
  private:
   void GenerateBlock(const Block &block);
   void GenerateItem(const BlockItem &item);
+  void GenerateIf(const BlockItem &item);
   std::string GenerateExpr(const Expr &expr);
+  void GenerateCond(const Expr &expr, const std::string &true_label,
+                    const std::string &false_label);
   int EvalConstExpr(const Expr &expr) const;
   void PushScope();
   void PopScope();
@@ -37,11 +40,13 @@ class KoopaGenerator {
                          const std::string &rhs);
   std::string NewValueName();
   std::string NewAllocName(const std::string &hint);
+  std::string NewBlockName(const std::string &hint);
 
   std::ostream &out_;
   std::vector<std::unordered_map<std::string, Symbol>> scopes_;
   int next_value_id_ = 0;
   int next_alloc_id_ = 0;
+  int next_block_id_ = 0;
   bool entry_terminated_ = false;
 };
 
@@ -57,7 +62,10 @@ class RiscvGenerator {
   void ScanExpr(const Expr &expr, int depth);
   void GenerateBlock(const Block &block);
   void GenerateItem(const BlockItem &item);
+  void GenerateIf(const BlockItem &item);
   void GenerateExpr(const Expr &expr, int depth = 0);
+  void GenerateCond(const Expr &expr, const std::string &true_label,
+                    const std::string &false_label, int depth = 0);
   int EvalConstExpr(const Expr &expr) const;
   void PushScope();
   void PopScope();
@@ -66,6 +74,7 @@ class RiscvGenerator {
   const Symbol &LookupSymbol(const std::string &name) const;
   int TempOffset(int depth) const;
   void EmitStackAdjust(int bytes);
+  std::string NewLabel(const std::string &hint);
   static int AlignTo16(int bytes);
 
   std::ostream &out_;
@@ -73,6 +82,7 @@ class RiscvGenerator {
   int next_var_offset_ = 0;
   int max_temp_depth_ = 0;
   int frame_size_ = 0;
+  int next_label_id_ = 0;
 };
 
 void WriteKoopa(const std::string &path, const Program &program);

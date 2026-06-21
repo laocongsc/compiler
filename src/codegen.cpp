@@ -93,7 +93,46 @@ void KoopaGenerator::GenerateItem(const BlockItem &item) {
     case BlockItem::Kind::Block:
       GenerateBlock(*item.block);
       break;
+    case BlockItem::Kind::If:
+      GenerateIf(item);
+      break;
   }
+}
+
+void KoopaGenerator::GenerateIf(const BlockItem &item) {
+  const std::string then_label = NewBlockName("then");
+  const std::string end_label = NewBlockName("end");
+  const std::string else_label =
+      item.else_stmt ? NewBlockName("else") : end_label;
+
+  GenerateCond(*item.expr, then_label, else_label);
+
+  out_ << then_label << ":\n";
+  entry_terminated_ = false;
+  GenerateItem(*item.then_stmt);
+  const bool then_terminated = entry_terminated_;
+  if (!then_terminated) {
+    out_ << "  jump " << end_label << "\n";
+  }
+
+  bool else_terminated = false;
+  if (item.else_stmt) {
+    out_ << else_label << ":\n";
+    entry_terminated_ = false;
+    GenerateItem(*item.else_stmt);
+    else_terminated = entry_terminated_;
+    if (!else_terminated) {
+      out_ << "  jump " << end_label << "\n";
+    }
+  }
+
+  if (item.else_stmt && then_terminated && else_terminated) {
+    entry_terminated_ = true;
+    return;
+  }
+
+  out_ << end_label << ":\n";
+  entry_terminated_ = false;
 }
 
 std::string KoopaGenerator::GenerateExpr(const Expr &expr) {
@@ -165,6 +204,34 @@ std::string KoopaGenerator::GenerateExpr(const Expr &expr) {
     }
   }
   throw std::runtime_error("unknown binary operator");
+}
+
+void KoopaGenerator::GenerateCond(const Expr &expr,
+                                  const std::string &true_label,
+                                  const std::string &false_label) {
+  if (const auto *binary = dynamic_cast<const BinaryExpr *>(&expr)) {
+    if (binary->op == BinaryOp::And) {
+      const std::string rhs_label = NewBlockName("land_rhs");
+      GenerateCond(*binary->lhs, rhs_label, false_label);
+      out_ << rhs_label << ":\n";
+      entry_terminated_ = false;
+      GenerateCond(*binary->rhs, true_label, false_label);
+      return;
+    }
+    if (binary->op == BinaryOp::Or) {
+      const std::string rhs_label = NewBlockName("lor_rhs");
+      GenerateCond(*binary->lhs, true_label, rhs_label);
+      out_ << rhs_label << ":\n";
+      entry_terminated_ = false;
+      GenerateCond(*binary->rhs, true_label, false_label);
+      return;
+    }
+  }
+
+  const std::string value = GenerateExpr(expr);
+  out_ << "  br " << value << ", " << true_label << ", " << false_label
+       << "\n";
+  entry_terminated_ = true;
 }
 
 int KoopaGenerator::EvalConstExpr(const Expr &expr) const {
@@ -277,6 +344,10 @@ std::string KoopaGenerator::NewAllocName(const std::string &hint) {
   return "@" + hint + "_" + std::to_string(next_alloc_id_++);
 }
 
+std::string KoopaGenerator::NewBlockName(const std::string &hint) {
+  return "%" + hint + "_" + std::to_string(next_block_id_++);
+}
+
 RiscvGenerator::RiscvGenerator(std::ostream &out) : out_(out) {}
 
 void RiscvGenerator::Generate(const Program &program) {
@@ -339,6 +410,13 @@ void RiscvGenerator::ScanItem(const BlockItem &item) {
       break;
     case BlockItem::Kind::Block:
       ScanBlock(*item.block);
+      break;
+    case BlockItem::Kind::If:
+      ScanExpr(*item.expr, 0);
+      ScanItem(*item.then_stmt);
+      if (item.else_stmt) {
+        ScanItem(*item.else_stmt);
+      }
       break;
   }
 }
@@ -418,7 +496,30 @@ void RiscvGenerator::GenerateItem(const BlockItem &item) {
     case BlockItem::Kind::Block:
       GenerateBlock(*item.block);
       break;
+    case BlockItem::Kind::If:
+      GenerateIf(item);
+      break;
   }
+}
+
+void RiscvGenerator::GenerateIf(const BlockItem &item) {
+  const std::string then_label = NewLabel("then");
+  const std::string end_label = NewLabel("end");
+  const std::string else_label = item.else_stmt ? NewLabel("else") : end_label;
+
+  GenerateCond(*item.expr, then_label, else_label);
+
+  out_ << then_label << ":\n";
+  GenerateItem(*item.then_stmt);
+  out_ << "  j " << end_label << "\n";
+
+  if (item.else_stmt) {
+    out_ << else_label << ":\n";
+    GenerateItem(*item.else_stmt);
+    out_ << "  j " << end_label << "\n";
+  }
+
+  out_ << end_label << ":\n";
 }
 
 void RiscvGenerator::GenerateExpr(const Expr &expr, int depth) {
@@ -510,6 +611,31 @@ void RiscvGenerator::GenerateExpr(const Expr &expr, int depth) {
       out_ << "  snez t0, t0\n";
       break;
   }
+}
+
+void RiscvGenerator::GenerateCond(const Expr &expr,
+                                  const std::string &true_label,
+                                  const std::string &false_label, int depth) {
+  if (const auto *binary = dynamic_cast<const BinaryExpr *>(&expr)) {
+    if (binary->op == BinaryOp::And) {
+      const std::string rhs_label = NewLabel("land_rhs");
+      GenerateCond(*binary->lhs, rhs_label, false_label, depth);
+      out_ << rhs_label << ":\n";
+      GenerateCond(*binary->rhs, true_label, false_label, depth);
+      return;
+    }
+    if (binary->op == BinaryOp::Or) {
+      const std::string rhs_label = NewLabel("lor_rhs");
+      GenerateCond(*binary->lhs, true_label, rhs_label, depth);
+      out_ << rhs_label << ":\n";
+      GenerateCond(*binary->rhs, true_label, false_label, depth);
+      return;
+    }
+  }
+
+  GenerateExpr(expr, depth);
+  out_ << "  bnez t0, " << true_label << "\n";
+  out_ << "  j " << false_label << "\n";
 }
 
 int RiscvGenerator::EvalConstExpr(const Expr &expr) const {
@@ -620,6 +746,10 @@ void RiscvGenerator::EmitStackAdjust(int bytes) {
   }
   out_ << "  li t0, " << bytes << "\n";
   out_ << "  add sp, sp, t0\n";
+}
+
+std::string RiscvGenerator::NewLabel(const std::string &hint) {
+  return ".L" + hint + "_" + std::to_string(next_label_id_++);
 }
 
 int RiscvGenerator::AlignTo16(int bytes) { return (bytes + 15) / 16 * 16; }
