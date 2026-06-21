@@ -3,6 +3,7 @@
 #include <string>
 
 enum class TokenKind {
+  Const,
   Int,
   Return,
   Ident,
@@ -12,6 +13,8 @@ enum class TokenKind {
   LBrace,
   RBrace,
   Semicolon,
+  Comma,
+  Assign,
   Plus,
   Minus,
   Not,

@@ -1,6 +1,8 @@
 #pragma once
 
 #include <memory>
+#include <string>
+#include <vector>
 
 enum class UnaryOp {
   Plus,
@@ -33,6 +35,11 @@ struct NumberExpr final : Expr {
   int value;
 };
 
+struct LValExpr final : Expr {
+  explicit LValExpr(std::string name) : name(std::move(name)) {}
+  std::string name;
+};
+
 struct UnaryExpr final : Expr {
   UnaryExpr(UnaryOp op, std::unique_ptr<Expr> operand)
       : op(op), operand(std::move(operand)) {}
@@ -46,4 +53,32 @@ struct BinaryExpr final : Expr {
   BinaryOp op;
   std::unique_ptr<Expr> lhs;
   std::unique_ptr<Expr> rhs;
+};
+
+struct ConstDef {
+  std::string name;
+  std::unique_ptr<Expr> init;
+};
+
+struct VarDef {
+  std::string name;
+  std::unique_ptr<Expr> init;
+};
+
+struct BlockItem {
+  enum class Kind {
+    ConstDecl,
+    VarDecl,
+    Assign,
+    Return,
+  } kind;
+
+  std::vector<ConstDef> const_defs;
+  std::vector<VarDef> var_defs;
+  std::string lval;
+  std::unique_ptr<Expr> expr;
+};
+
+struct Program {
+  std::vector<BlockItem> items;
 };

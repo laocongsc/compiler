@@ -59,11 +59,11 @@ int main(int argc, char **argv) {
     const Options options = ParseArgs(argc, argv);
     Lexer lexer(ReadFile(options.input));
     Parser parser(lexer.Tokenize());
-    const std::unique_ptr<Expr> return_value = parser.ParseCompUnit();
+    const std::unique_ptr<Program> program = parser.ParseCompUnit();
     if (options.mode == "-koopa") {
-      WriteKoopa(options.output, *return_value);
+      WriteKoopa(options.output, *program);
     } else {
-      WriteRiscv(options.output, *return_value);
+      WriteRiscv(options.output, *program);
     }
     return 0;
   } catch (const std::exception &err) {

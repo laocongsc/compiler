@@ -77,6 +77,9 @@ Token Lexer::ReadIdentOrKeyword() {
   }
 
   const std::string text = input_.substr(start, pos_ - start);
+  if (text == "const") {
+    return {TokenKind::Const, text};
+  }
   if (text == "int") {
     return {TokenKind::Int, text};
   }
@@ -145,6 +148,10 @@ Token Lexer::ReadPunct() {
       return {TokenKind::RBrace, "}"};
     case ';':
       return {TokenKind::Semicolon, ";"};
+    case ',':
+      return {TokenKind::Comma, ","};
+    case '=':
+      return {TokenKind::Assign, "="};
     case '+':
       return {TokenKind::Plus, "+"};
     case '-':

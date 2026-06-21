@@ -5,21 +5,89 @@
 
 Parser::Parser(std::vector<Token> tokens) : tokens_(std::move(tokens)) {}
 
-std::unique_ptr<Expr> Parser::ParseCompUnit() {
+std::unique_ptr<Program> Parser::ParseCompUnit() {
   Expect(TokenKind::Int, "'int'");
   const Token ident = Expect(TokenKind::Ident, "function name");
   if (ident.text != "main") {
-    throw std::runtime_error("Lv3 only supports function 'main'");
+    throw std::runtime_error("Lv4 only supports function 'main'");
   }
   Expect(TokenKind::LParen, "'('");
   Expect(TokenKind::RParen, "')'");
   Expect(TokenKind::LBrace, "'{'");
-  Expect(TokenKind::Return, "'return'");
-  std::unique_ptr<Expr> return_value = ParseExp();
-  Expect(TokenKind::Semicolon, "';'");
+
+  auto program = std::make_unique<Program>();
+  while (Peek().kind != TokenKind::RBrace) {
+    program->items.push_back(ParseBlockItem());
+  }
+
   Expect(TokenKind::RBrace, "'}'");
   Expect(TokenKind::End, "end of file");
-  return return_value;
+  return program;
+}
+
+BlockItem Parser::ParseBlockItem() {
+  if (Peek().kind == TokenKind::Const) {
+    return ParseConstDecl();
+  }
+  if (Peek().kind == TokenKind::Int) {
+    return ParseVarDecl();
+  }
+  return ParseStmt();
+}
+
+BlockItem Parser::ParseConstDecl() {
+  BlockItem item;
+  item.kind = BlockItem::Kind::ConstDecl;
+  Expect(TokenKind::Const, "'const'");
+  Expect(TokenKind::Int, "'int'");
+  while (true) {
+    ConstDef def;
+    def.name = Expect(TokenKind::Ident, "constant name").text;
+    Expect(TokenKind::Assign, "'='");
+    def.init = ParseExp();
+    item.const_defs.push_back(std::move(def));
+    if (!Match(TokenKind::Comma)) {
+      break;
+    }
+  }
+  Expect(TokenKind::Semicolon, "';'");
+  return item;
+}
+
+BlockItem Parser::ParseVarDecl() {
+  BlockItem item;
+  item.kind = BlockItem::Kind::VarDecl;
+  Expect(TokenKind::Int, "'int'");
+  while (true) {
+    VarDef def;
+    def.name = Expect(TokenKind::Ident, "variable name").text;
+    if (Match(TokenKind::Assign)) {
+      def.init = ParseExp();
+    }
+    item.var_defs.push_back(std::move(def));
+    if (!Match(TokenKind::Comma)) {
+      break;
+    }
+  }
+  Expect(TokenKind::Semicolon, "';'");
+  return item;
+}
+
+BlockItem Parser::ParseStmt() {
+  BlockItem item;
+  if (Match(TokenKind::Return)) {
+    item.kind = BlockItem::Kind::Return;
+    item.expr = ParseExp();
+    Expect(TokenKind::Semicolon, "';'");
+    return item;
+  }
+
+  item.kind = BlockItem::Kind::Assign;
+  item.lval = Expect(TokenKind::Ident, "assignment target").text;
+  Expect(TokenKind::Assign, "'='");
+  item.expr = ParseExp();
+  Expect(TokenKind::Semicolon, "';'");
+  return item;
 }
 
 std::unique_ptr<Expr> Parser::ParseExp() { return ParseLOrExp(); }
@@ -130,8 +198,11 @@ std::unique_ptr<Expr> Parser::ParsePrimaryExp() {
     Expect(TokenKind::RParen, "')'");
     return expr;
   }
+  if (Peek().kind == TokenKind::Ident) {
+    return std::make_unique<LValExpr>(Expect(TokenKind::Ident, "identifier").text);
+  }
   return std::make_unique<NumberExpr>(
-      Expect(TokenKind::Number, "integer constant or '('").value);
+      Expect(TokenKind::Number, "integer constant, identifier or '('").value);
 }
 
 const Token &Parser::Peek() const {

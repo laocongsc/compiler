@@ -11,9 +11,14 @@ class Parser {
  public:
   explicit Parser(std::vector<Token> tokens);
 
-  std::unique_ptr<Expr> ParseCompUnit();
+  std::unique_ptr<Program> ParseCompUnit();
 
  private:
+  BlockItem ParseBlockItem();
+  BlockItem ParseConstDecl();
+  BlockItem ParseVarDecl();
+  BlockItem ParseStmt();
+
   std::unique_ptr<Expr> ParseExp();
   std::unique_ptr<Expr> ParseLOrExp();
   std::unique_ptr<Expr> ParseLAndExp();
