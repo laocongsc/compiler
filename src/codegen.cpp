@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <fstream>
+#include <functional>
+#include <numeric>
 #include <ostream>
 #include <stdexcept>
 #include <utility>
@@ -31,6 +33,120 @@ void EmitStoreStack(std::ostream &out, const std::string &reg, int offset) {
 }
 
 std::string ToAsmName(const std::string &name) { return name; }
+
+int Product(const std::vector<int> &dims, size_t start = 0) {
+  int result = 1;
+  for (size_t i = start; i < dims.size(); ++i) {
+    result *= dims[i];
+  }
+  return result;
+}
+
+int TypeSize(const std::vector<int> &dims, size_t start = 0) {
+  return Product(dims, start) * 4;
+}
+
+std::string ArrayTypeName(const std::vector<int> &dims, size_t start = 0) {
+  std::string type = "i32";
+  for (size_t i = dims.size(); i > start; --i) {
+    type = "[" + type + ", " + std::to_string(dims[i - 1]) + "]";
+  }
+  return type;
+}
+
+std::string PointerParamType(const std::vector<int> &dims) {
+  return "*" + ArrayTypeName(dims);
+}
+
+void FlattenInitExprs(const InitVal &init, const std::vector<int> &dims,
+                      size_t dim, size_t &pos,
+                      std::vector<const Expr *> &values) {
+  if (!init.is_list) {
+    if (pos < values.size()) {
+      values[pos] = init.expr.get();
+    }
+    ++pos;
+    return;
+  }
+
+  const size_t start = pos;
+  for (const InitVal &child : init.list) {
+    if (!child.is_list) {
+      FlattenInitExprs(child, dims, dims.size(), pos, values);
+      continue;
+    }
+
+    size_t child_dim = dim + 1;
+    if (child_dim >= dims.size()) {
+      FlattenInitExprs(child, dims, child_dim, pos, values);
+      continue;
+    }
+    const size_t rel = pos - start;
+    while (child_dim + 1 < dims.size() &&
+           rel % static_cast<size_t>(Product(dims, child_dim)) != 0) {
+      ++child_dim;
+    }
+    while (child_dim + 1 < dims.size() &&
+           rel % static_cast<size_t>(Product(dims, child_dim)) == 0 &&
+           rel % static_cast<size_t>(Product(dims, child_dim + 1)) == 0 &&
+           rel != 0) {
+      break;
+    }
+    const size_t child_start = pos;
+    FlattenInitExprs(child, dims, child_dim, pos, values);
+    const size_t child_size = static_cast<size_t>(Product(dims, child_dim));
+    pos = std::max(pos, child_start + child_size);
+  }
+}
+
+std::vector<const Expr *> FlattenInitExprs(const InitVal &init,
+                                           const std::vector<int> &dims) {
+  std::vector<const Expr *> values(Product(dims), nullptr);
+  size_t pos = 0;
+  FlattenInitExprs(init, dims, 0, pos, values);
+  return values;
+}
+
+std::string FormatAggregate(const std::vector<int> &values,
+                            const std::vector<int> &dims, size_t dim,
+                            size_t &offset) {
+  if (dim == dims.size()) {
+    return std::to_string(values[offset++]);
+  }
+  std::string result = "{";
+  for (int i = 0; i < dims[dim]; ++i) {
+    if (i != 0) {
+      result += ", ";
+    }
+    result += FormatAggregate(values, dims, dim + 1, offset);
+  }
+  result += "}";
+  return result;
+}
+
+std::string FormatAggregate(const std::vector<int> &values,
+                            const std::vector<int> &dims) {
+  if (std::all_of(values.begin(), values.end(), [](int value) { return value == 0; })) {
+    return "zeroinit";
+  }
+  size_t offset = 0;
+  return FormatAggregate(values, dims, 0, offset);
+}
+
+Symbol ScalarConstSymbol(int value) {
+  Symbol symbol;
+  symbol.kind = Symbol::Kind::Const;
+  symbol.const_value = value;
+  return symbol;
+}
+
+Symbol GlobalScalarSymbol(const std::string &name) {
+  Symbol symbol;
+  symbol.kind = Symbol::Kind::GlobalVar;
+  symbol.ir_name = "@" + name;
+  symbol.asm_name = name;
+  return symbol;
+}
 
 }  // namespace
 
@@ -89,21 +205,61 @@ void KoopaGenerator::GenerateGlobalItem(const GlobalItem &item) {
   switch (item.kind) {
     case GlobalItem::Kind::ConstDecl:
       for (const ConstDef &def : item.const_defs) {
-        InsertSymbol(def.name,
-                     Symbol{Symbol::Kind::Const, EvalConstExpr(*def.init), "", "", 0});
+        const std::vector<int> dims = EvalDimensions(def.dimensions);
+        if (dims.empty()) {
+          InsertSymbol(def.name,
+                       ScalarConstSymbol(EvalConstExpr(*def.init.expr)));
+        } else {
+          const std::vector<const Expr *> exprs = FlattenInitExprs(def.init, dims);
+          std::vector<int> values(exprs.size(), 0);
+          for (size_t i = 0; i < exprs.size(); ++i) {
+            if (exprs[i] != nullptr) {
+              values[i] = EvalConstExpr(*exprs[i]);
+            }
+          }
+          out_ << "global @" << def.name << " = alloc " << ArrayTypeName(dims)
+               << ", " << FormatAggregate(values, dims) << "\n";
+          Symbol symbol;
+          symbol.kind = Symbol::Kind::Const;
+          symbol.ir_name = "@" + def.name;
+          symbol.asm_name = def.name;
+          symbol.dimensions = dims;
+          InsertSymbol(def.name, std::move(symbol));
+        }
       }
       break;
     case GlobalItem::Kind::VarDecl:
       for (const VarDef &def : item.var_defs) {
-        const int value = def.init ? EvalConstExpr(*def.init) : 0;
-        out_ << "global @" << def.name << " = alloc i32, ";
-        if (def.init) {
-          out_ << value << "\n";
+        const std::vector<int> dims = EvalDimensions(def.dimensions);
+        if (dims.empty()) {
+          const int value = def.has_init ? EvalConstExpr(*def.init.expr) : 0;
+          out_ << "global @" << def.name << " = alloc i32, ";
+          if (def.has_init) {
+            out_ << value << "\n";
+          } else {
+            out_ << "zeroinit\n";
+          }
+          InsertSymbol(def.name,
+                       GlobalScalarSymbol(def.name));
         } else {
-          out_ << "zeroinit\n";
+          std::vector<int> values(Product(dims), 0);
+          if (def.has_init) {
+            const std::vector<const Expr *> exprs = FlattenInitExprs(def.init, dims);
+            for (size_t i = 0; i < exprs.size(); ++i) {
+              if (exprs[i] != nullptr) {
+                values[i] = EvalConstExpr(*exprs[i]);
+              }
+            }
+          }
+          out_ << "global @" << def.name << " = alloc " << ArrayTypeName(dims)
+               << ", " << FormatAggregate(values, dims) << "\n";
+          Symbol symbol;
+          symbol.kind = Symbol::Kind::GlobalVar;
+          symbol.ir_name = "@" + def.name;
+          symbol.asm_name = def.name;
+          symbol.dimensions = dims;
+          InsertSymbol(def.name, std::move(symbol));
         }
-        InsertSymbol(def.name,
-                     Symbol{Symbol::Kind::GlobalVar, 0, "@" + def.name, def.name, 0});
       }
       break;
     case GlobalItem::Kind::FuncDef:
@@ -122,7 +278,13 @@ void KoopaGenerator::GenerateFunction(const FunctionDef &function) {
     if (i != 0) {
       out_ << ", ";
     }
-    out_ << "%param_" << i << ": i32";
+    const Param &param = function.params[i];
+    out_ << "%param_" << i << ": ";
+    if (param.is_array) {
+      out_ << PointerParamType(EvalDimensions(param.dimensions));
+    } else {
+      out_ << "i32";
+    }
   }
   out_ << ")";
   if (function.return_type == TypeKind::Int) {
@@ -134,10 +296,16 @@ void KoopaGenerator::GenerateFunction(const FunctionDef &function) {
   }
 
   PushScope();
-  for (const Param &param : function.params) {
+  for (size_t i = 0; i < function.params.size(); ++i) {
+    const Param &param = function.params[i];
     const std::string &alloc = param_alloc_names_.at(&param);
-    out_ << "  store %param_" << (&param - function.params.data()) << ", " << alloc << "\n";
-    InsertSymbol(param.name, Symbol{Symbol::Kind::Var, 0, alloc, "", 0});
+    out_ << "  store %param_" << i << ", " << alloc << "\n";
+    Symbol symbol;
+    symbol.kind = Symbol::Kind::Var;
+    symbol.ir_name = alloc;
+    symbol.dimensions = EvalDimensions(param.dimensions);
+    symbol.is_pointer = param.is_array;
+    InsertSymbol(param.name, std::move(symbol));
   }
   GenerateBlock(*function.block);
   PopScope();
@@ -167,28 +335,41 @@ void KoopaGenerator::ResetFunctionState() {
 
 void KoopaGenerator::CollectAllocs(const FunctionDef &function) {
   for (const Param &param : function.params) {
+    const std::vector<int> dims = EvalDimensions(param.dimensions);
     const std::string ir_name = NewAllocName(param.name);
     param_alloc_names_.emplace(&param, ir_name);
-    alloc_lines_.push_back("  " + ir_name + " = alloc i32\n");
+    const std::string type = param.is_array ? PointerParamType(dims) : "i32";
+    alloc_lines_.push_back("  " + ir_name + " = alloc " + type + "\n");
   }
   CollectAllocs(*function.block);
 }
 
 void KoopaGenerator::CollectAllocs(const Block &block) {
+  PushScope();
   for (const BlockItem &item : block.items) {
     CollectAllocs(item);
   }
+  PopScope();
 }
 
 void KoopaGenerator::CollectAllocs(const BlockItem &item) {
   switch (item.kind) {
     case BlockItem::Kind::VarDecl:
       for (const VarDef &def : item.var_defs) {
+        const std::vector<int> dims = EvalDimensions(def.dimensions);
         const std::string ir_name = NewAllocName(def.name);
         var_alloc_names_.emplace(&def, ir_name);
-        alloc_lines_.push_back("  " + ir_name + " = alloc i32\n");
-        if (def.init) {
-          CollectLogicTemps(*def.init);
+        alloc_lines_.push_back("  " + ir_name + " = alloc " + ArrayTypeName(dims) + "\n");
+        if (def.has_init) {
+          if (dims.empty()) {
+            CollectLogicTemps(*def.init.expr);
+          } else {
+            for (const Expr *expr : FlattenInitExprs(def.init, dims)) {
+              if (expr != nullptr) {
+                CollectLogicTemps(*expr);
+              }
+            }
+          }
         }
       }
       break;
@@ -207,11 +388,33 @@ void KoopaGenerator::CollectAllocs(const BlockItem &item) {
       CollectAllocs(*item.body_stmt);
       break;
     case BlockItem::Kind::ConstDecl:
+      for (const ConstDef &def : item.const_defs) {
+        const std::vector<int> dims = EvalDimensions(def.dimensions);
+        if (dims.empty()) {
+          InsertSymbol(def.name,
+                       ScalarConstSymbol(EvalConstExpr(*def.init.expr)));
+        } else {
+          const std::string ir_name = NewAllocName(def.name);
+          alloc_lines_.push_back("  " + ir_name + " = alloc " + ArrayTypeName(dims) + "\n");
+          var_alloc_names_.emplace(reinterpret_cast<const VarDef *>(&def), ir_name);
+          for (const Expr *expr : FlattenInitExprs(def.init, dims)) {
+            if (expr != nullptr) {
+              CollectLogicTemps(*expr);
+            }
+          }
+        }
+      }
+      break;
     case BlockItem::Kind::Assign:
     case BlockItem::Kind::Return:
     case BlockItem::Kind::ExprStmt:
       if (item.expr) {
         CollectLogicTemps(*item.expr);
+      }
+      if (item.kind == BlockItem::Kind::Assign && item.lval) {
+        for (const auto &index : item.lval->indices) {
+          CollectLogicTemps(*index);
+        }
       }
       break;
     case BlockItem::Kind::Break:
@@ -221,6 +424,12 @@ void KoopaGenerator::CollectAllocs(const BlockItem &item) {
 }
 
 void KoopaGenerator::CollectLogicTemps(const Expr &expr) {
+  if (const auto *lval = dynamic_cast<const LValExpr *>(&expr)) {
+    for (const auto &index : lval->indices) {
+      CollectLogicTemps(*index);
+    }
+    return;
+  }
   if (const auto *call = dynamic_cast<const CallExpr *>(&expr)) {
     for (const auto &arg : call->args) {
       CollectLogicTemps(*arg);
@@ -259,27 +468,48 @@ void KoopaGenerator::GenerateItem(const BlockItem &item) {
   switch (item.kind) {
     case BlockItem::Kind::ConstDecl:
       for (const ConstDef &def : item.const_defs) {
-        InsertSymbol(def.name,
-                     Symbol{Symbol::Kind::Const, EvalConstExpr(*def.init), "", "", 0});
+        const std::vector<int> dims = EvalDimensions(def.dimensions);
+        if (dims.empty()) {
+          InsertSymbol(def.name,
+                       ScalarConstSymbol(EvalConstExpr(*def.init.expr)));
+        } else {
+          const std::string &ir_name = var_alloc_names_.at(reinterpret_cast<const VarDef *>(&def));
+          Symbol symbol;
+          symbol.kind = Symbol::Kind::Const;
+          symbol.ir_name = ir_name;
+          symbol.dimensions = dims;
+          InsertSymbol(def.name, symbol);
+          GenerateLocalArrayInit(symbol, def.init);
+        }
       }
       break;
     case BlockItem::Kind::VarDecl:
       for (const VarDef &def : item.var_defs) {
+        const std::vector<int> dims = EvalDimensions(def.dimensions);
         const std::string &ir_name = var_alloc_names_.at(&def);
-        if (def.init) {
-          const std::string value = GenerateExpr(*def.init);
-          out_ << "  store " << value << ", " << ir_name << "\n";
+        Symbol symbol;
+        symbol.kind = Symbol::Kind::Var;
+        symbol.ir_name = ir_name;
+        symbol.dimensions = dims;
+        if (def.has_init) {
+          if (dims.empty()) {
+            const std::string value = GenerateExpr(*def.init.expr);
+            out_ << "  store " << value << ", " << ir_name << "\n";
+          } else {
+            GenerateLocalArrayInit(symbol, def.init);
+          }
         }
-        InsertSymbol(def.name, Symbol{Symbol::Kind::Var, 0, ir_name, "", 0});
+        InsertSymbol(def.name, std::move(symbol));
       }
       break;
     case BlockItem::Kind::Assign: {
-      Symbol &symbol = LookupSymbol(item.lval);
+      const Symbol &symbol = LookupSymbol(item.lval->name);
       if (symbol.kind == Symbol::Kind::Const) {
-        throw std::runtime_error("cannot assign to constant: " + item.lval);
+        throw std::runtime_error("cannot assign to constant: " + item.lval->name);
       }
       const std::string value = GenerateExpr(*item.expr);
-      out_ << "  store " << value << ", " << symbol.ir_name << "\n";
+      const KoopaAddrInfo addr = GenerateLValAddress(*item.lval);
+      out_ << "  store " << value << ", " << addr.ptr << "\n";
       break;
     }
     case BlockItem::Kind::Return:
@@ -389,12 +619,24 @@ std::string KoopaGenerator::GenerateExpr(const Expr &expr) {
 
   if (const auto *lval = dynamic_cast<const LValExpr *>(&expr)) {
     const Symbol &symbol = LookupSymbol(lval->name);
-    if (symbol.kind == Symbol::Kind::Const) {
+    if (symbol.kind == Symbol::Kind::Const && symbol.dimensions.empty()) {
       return std::to_string(symbol.const_value);
     }
-    const std::string name = NewValueName();
-    out_ << "  " << name << " = load " << symbol.ir_name << "\n";
-    return name;
+    const KoopaAddrInfo addr = GenerateLValAddress(*lval);
+    const bool scalar = symbol.is_pointer
+                            ? lval->indices.size() > symbol.dimensions.size()
+                            : addr.remaining_dimensions.empty();
+    if (scalar) {
+      const std::string name = NewValueName();
+      out_ << "  " << name << " = load " << addr.ptr << "\n";
+      return name;
+    }
+    if (!symbol.is_pointer || addr.indices_used > 0) {
+      const std::string name = NewValueName();
+      out_ << "  " << name << " = getelemptr " << addr.ptr << ", 0\n";
+      return name;
+    }
+    return addr.ptr;
   }
 
   if (const auto *call = dynamic_cast<const CallExpr *>(&expr)) {
@@ -491,6 +733,39 @@ std::string KoopaGenerator::GenerateExpr(const Expr &expr) {
   throw std::runtime_error("unknown binary operator");
 }
 
+KoopaAddrInfo KoopaGenerator::GenerateLValAddress(const LValExpr &lval) {
+  const Symbol &symbol = LookupSymbol(lval.name);
+  if (symbol.dimensions.empty() && !symbol.is_pointer) {
+    return KoopaAddrInfo{symbol.ir_name, {}, false, 0};
+  }
+
+  std::string ptr = symbol.ir_name;
+  if (symbol.is_pointer) {
+    const std::string loaded = NewValueName();
+    out_ << "  " << loaded << " = load " << ptr << "\n";
+    ptr = loaded;
+  }
+
+  for (size_t i = 0; i < lval.indices.size(); ++i) {
+    const std::string index = GenerateExpr(*lval.indices[i]);
+    const std::string next = NewValueName();
+    if (symbol.is_pointer && i == 0) {
+      out_ << "  " << next << " = getptr " << ptr << ", " << index << "\n";
+    } else {
+      out_ << "  " << next << " = getelemptr " << ptr << ", " << index << "\n";
+    }
+    ptr = next;
+  }
+
+  std::vector<int> remaining;
+  if (lval.indices.size() < symbol.dimensions.size()) {
+    remaining.assign(symbol.dimensions.begin() + static_cast<long>(lval.indices.size()),
+                     symbol.dimensions.end());
+  }
+  return KoopaAddrInfo{ptr, remaining, symbol.is_pointer,
+                       static_cast<int>(lval.indices.size())};
+}
+
 void KoopaGenerator::GenerateCond(const Expr &expr, const std::string &true_label,
                                   const std::string &false_label) {
   if (const auto *binary = dynamic_cast<const BinaryExpr *>(&expr)) {
@@ -517,13 +792,40 @@ void KoopaGenerator::GenerateCond(const Expr &expr, const std::string &true_labe
   entry_terminated_ = true;
 }
 
+std::vector<int> KoopaGenerator::EvalDimensions(
+    const std::vector<std::unique_ptr<Expr>> &dimensions) const {
+  std::vector<int> result;
+  for (const auto &dimension : dimensions) {
+    result.push_back(EvalConstExpr(*dimension));
+  }
+  return result;
+}
+
+void KoopaGenerator::GenerateLocalArrayInit(const Symbol &symbol, const InitVal &init) {
+  const std::vector<const Expr *> exprs = FlattenInitExprs(init, symbol.dimensions);
+  for (size_t i = 0; i < exprs.size(); ++i) {
+    std::string ptr = symbol.ir_name;
+    size_t linear = i;
+    for (size_t dim = 0; dim < symbol.dimensions.size(); ++dim) {
+      const int stride = Product(symbol.dimensions, dim + 1);
+      const int index = static_cast<int>(linear / stride);
+      linear %= stride;
+      const std::string next = NewValueName();
+      out_ << "  " << next << " = getelemptr " << ptr << ", " << index << "\n";
+      ptr = next;
+    }
+    const std::string value = exprs[i] ? GenerateExpr(*exprs[i]) : "0";
+    out_ << "  store " << value << ", " << ptr << "\n";
+  }
+}
+
 int KoopaGenerator::EvalConstExpr(const Expr &expr) const {
   if (const auto *number = dynamic_cast<const NumberExpr *>(&expr)) {
     return number->value;
   }
   if (const auto *lval = dynamic_cast<const LValExpr *>(&expr)) {
     const Symbol &symbol = LookupSymbol(lval->name);
-    if (symbol.kind != Symbol::Kind::Const) {
+    if (symbol.kind != Symbol::Kind::Const || !symbol.dimensions.empty() || !lval->indices.empty()) {
       throw std::runtime_error("variable is not allowed in constant expression: " + lval->name);
     }
     return symbol.const_value;
@@ -622,6 +924,8 @@ std::string KoopaGenerator::JoinArgs(const std::vector<std::string> &args) {
   return result;
 }
 
+// RISC-V backend.
+
 RiscvGenerator::RiscvGenerator(std::ostream &out) : out_(out) {}
 
 void RiscvGenerator::Generate(const Program &program) {
@@ -633,7 +937,17 @@ void RiscvGenerator::Generate(const Program &program) {
   bool has_data = false;
   for (const GlobalItem &item : program.items) {
     if (item.kind == GlobalItem::Kind::ConstDecl || item.kind == GlobalItem::Kind::VarDecl) {
-      if (!has_data && item.kind == GlobalItem::Kind::VarDecl) {
+      bool emits_data = false;
+      if (item.kind == GlobalItem::Kind::VarDecl) {
+        emits_data = true;
+      } else {
+        for (const ConstDef &def : item.const_defs) {
+          if (!def.dimensions.empty()) {
+            emits_data = true;
+          }
+        }
+      }
+      if (!has_data && emits_data) {
         out_ << "  .data\n";
         has_data = true;
       }
@@ -682,22 +996,53 @@ void RiscvGenerator::GenerateGlobalItem(const GlobalItem &item) {
   switch (item.kind) {
     case GlobalItem::Kind::ConstDecl:
       for (const ConstDef &def : item.const_defs) {
-        InsertSymbol(def.name,
-                     Symbol{Symbol::Kind::Const, EvalConstExpr(*def.init), "", "", 0});
+        const std::vector<int> dims = EvalDimensions(def.dimensions);
+        if (dims.empty()) {
+          InsertSymbol(def.name,
+                       ScalarConstSymbol(EvalConstExpr(*def.init.expr)));
+        } else {
+          const std::vector<const Expr *> exprs = FlattenInitExprs(def.init, dims);
+          out_ << "  .globl " << ToAsmName(def.name) << "\n";
+          out_ << ToAsmName(def.name) << ":\n";
+          for (const Expr *expr : exprs) {
+            out_ << "  .word " << (expr ? EvalConstExpr(*expr) : 0) << "\n";
+          }
+          Symbol symbol;
+          symbol.kind = Symbol::Kind::Const;
+          symbol.asm_name = ToAsmName(def.name);
+          symbol.dimensions = dims;
+          InsertSymbol(def.name, std::move(symbol));
+        }
       }
       break;
     case GlobalItem::Kind::VarDecl:
       for (const VarDef &def : item.var_defs) {
-        const int value = def.init ? EvalConstExpr(*def.init) : 0;
+        const std::vector<int> dims = EvalDimensions(def.dimensions);
         out_ << "  .globl " << ToAsmName(def.name) << "\n";
         out_ << ToAsmName(def.name) << ":\n";
-        if (def.init) {
-          out_ << "  .word " << value << "\n";
+        if (dims.empty()) {
+          if (def.has_init) {
+            out_ << "  .word " << EvalConstExpr(*def.init.expr) << "\n";
+          } else {
+            out_ << "  .zero 4\n";
+          }
+          InsertSymbol(def.name,
+                       GlobalScalarSymbol(ToAsmName(def.name)));
         } else {
-          out_ << "  .zero 4\n";
+          if (def.has_init) {
+            const std::vector<const Expr *> exprs = FlattenInitExprs(def.init, dims);
+            for (const Expr *expr : exprs) {
+              out_ << "  .word " << (expr ? EvalConstExpr(*expr) : 0) << "\n";
+            }
+          } else {
+            out_ << "  .zero " << TypeSize(dims) << "\n";
+          }
+          Symbol symbol;
+          symbol.kind = Symbol::Kind::GlobalVar;
+          symbol.asm_name = ToAsmName(def.name);
+          symbol.dimensions = dims;
+          InsertSymbol(def.name, std::move(symbol));
         }
-        InsertSymbol(def.name,
-                     Symbol{Symbol::Kind::GlobalVar, 0, "@" + def.name, ToAsmName(def.name), 0});
       }
       break;
     case GlobalItem::Kind::FuncDef:
@@ -725,11 +1070,14 @@ void RiscvGenerator::GenerateFunction(const FunctionDef &function) {
 
   PushScope();
   for (size_t i = 0; i < function.params.size(); ++i) {
+    const Param &param = function.params[i];
     Symbol symbol;
     symbol.kind = Symbol::Kind::Var;
     symbol.stack_offset = next_var_offset_;
     next_var_offset_ += 4;
-    InsertSymbol(function.params[i].name, symbol);
+    symbol.dimensions = EvalDimensions(param.dimensions);
+    symbol.is_pointer = param.is_array;
+    InsertSymbol(param.name, symbol);
     if (i < 8) {
       EmitStoreStack(out_, "a" + std::to_string(i), symbol.stack_offset);
     } else {
@@ -768,6 +1116,8 @@ void RiscvGenerator::ScanFunction(const FunctionDef &function) {
     symbol.kind = Symbol::Kind::Var;
     symbol.stack_offset = next_var_offset_;
     next_var_offset_ += 4;
+    symbol.dimensions = EvalDimensions(param.dimensions);
+    symbol.is_pointer = param.is_array;
     InsertSymbol(param.name, symbol);
   }
   ScanBlock(*function.block);
@@ -786,24 +1136,52 @@ void RiscvGenerator::ScanItem(const BlockItem &item) {
   switch (item.kind) {
     case BlockItem::Kind::ConstDecl:
       for (const ConstDef &def : item.const_defs) {
-        InsertSymbol(def.name,
-                     Symbol{Symbol::Kind::Const, EvalConstExpr(*def.init), "", "", 0});
+        const std::vector<int> dims = EvalDimensions(def.dimensions);
+        if (dims.empty()) {
+          InsertSymbol(def.name,
+                       ScalarConstSymbol(EvalConstExpr(*def.init.expr)));
+        } else {
+          Symbol symbol;
+          symbol.kind = Symbol::Kind::Const;
+          symbol.stack_offset = next_var_offset_;
+          symbol.dimensions = dims;
+          next_var_offset_ += TypeSize(dims);
+          InsertSymbol(def.name, symbol);
+          for (const Expr *expr : FlattenInitExprs(def.init, dims)) {
+            if (expr != nullptr) {
+              ScanExpr(*expr, 0);
+            }
+          }
+        }
       }
       break;
     case BlockItem::Kind::VarDecl:
       for (const VarDef &def : item.var_defs) {
-        if (def.init) {
-          ScanExpr(*def.init, 0);
+        const std::vector<int> dims = EvalDimensions(def.dimensions);
+        if (def.has_init) {
+          if (dims.empty()) {
+            ScanExpr(*def.init.expr, 0);
+          } else {
+            for (const Expr *expr : FlattenInitExprs(def.init, dims)) {
+              if (expr != nullptr) {
+                ScanExpr(*expr, 0);
+              }
+            }
+          }
         }
         Symbol symbol;
         symbol.kind = Symbol::Kind::Var;
         symbol.stack_offset = next_var_offset_;
-        next_var_offset_ += 4;
+        symbol.dimensions = dims;
+        next_var_offset_ += dims.empty() ? 4 : TypeSize(dims);
         InsertSymbol(def.name, symbol);
       }
       break;
     case BlockItem::Kind::Assign:
-      LookupSymbol(item.lval);
+      LookupSymbol(item.lval->name);
+      for (const auto &index : item.lval->indices) {
+        ScanExpr(*index, 0);
+      }
       ScanExpr(*item.expr, 0);
       break;
     case BlockItem::Kind::Return:
@@ -839,6 +1217,10 @@ void RiscvGenerator::ScanItem(const BlockItem &item) {
 void RiscvGenerator::ScanExpr(const Expr &expr, int depth) {
   if (const auto *lval = dynamic_cast<const LValExpr *>(&expr)) {
     LookupSymbol(lval->name);
+    for (const auto &index : lval->indices) {
+      ScanExpr(*index, depth);
+    }
+    max_temp_depth_ = std::max(max_temp_depth_, depth + 2);
     return;
   }
   if (dynamic_cast<const NumberExpr *>(&expr) != nullptr) {
@@ -850,7 +1232,7 @@ void RiscvGenerator::ScanExpr(const Expr &expr, int depth) {
       out_arg_bytes_ = std::max(out_arg_bytes_, static_cast<int>(call->args.size() - 8) * 4);
     }
     const int arg_count = static_cast<int>(call->args.size());
-    max_temp_depth_ = std::max(max_temp_depth_, depth + arg_count);
+    max_temp_depth_ = std::max(max_temp_depth_, depth + arg_count + 2);
     for (const auto &arg : call->args) {
       ScanExpr(*arg, depth + arg_count);
     }
@@ -884,30 +1266,50 @@ void RiscvGenerator::GenerateItem(const BlockItem &item) {
   switch (item.kind) {
     case BlockItem::Kind::ConstDecl:
       for (const ConstDef &def : item.const_defs) {
-        InsertSymbol(def.name,
-                     Symbol{Symbol::Kind::Const, EvalConstExpr(*def.init), "", "", 0});
+        const std::vector<int> dims = EvalDimensions(def.dimensions);
+        if (dims.empty()) {
+          InsertSymbol(def.name,
+                       ScalarConstSymbol(EvalConstExpr(*def.init.expr)));
+        } else {
+          Symbol symbol;
+          symbol.kind = Symbol::Kind::Const;
+          symbol.stack_offset = next_var_offset_;
+          symbol.dimensions = dims;
+          next_var_offset_ += TypeSize(dims);
+          InsertSymbol(def.name, symbol);
+          GenerateLocalArrayInit(symbol, def.init, 0);
+        }
       }
       break;
     case BlockItem::Kind::VarDecl:
       for (const VarDef &def : item.var_defs) {
+        const std::vector<int> dims = EvalDimensions(def.dimensions);
         Symbol symbol;
         symbol.kind = Symbol::Kind::Var;
         symbol.stack_offset = next_var_offset_;
-        next_var_offset_ += 4;
-        if (def.init) {
-          GenerateExpr(*def.init);
-          StoreToSymbol(symbol, "t0");
+        symbol.dimensions = dims;
+        next_var_offset_ += dims.empty() ? 4 : TypeSize(dims);
+        if (def.has_init) {
+          if (dims.empty()) {
+            GenerateExpr(*def.init.expr);
+            StoreToSymbol(symbol, "t0");
+          } else {
+            GenerateLocalArrayInit(symbol, def.init, 0);
+          }
         }
         InsertSymbol(def.name, symbol);
       }
       break;
     case BlockItem::Kind::Assign: {
-      const Symbol &symbol = LookupSymbol(item.lval);
+      const Symbol &symbol = LookupSymbol(item.lval->name);
       if (symbol.kind == Symbol::Kind::Const) {
-        throw std::runtime_error("cannot assign to constant: " + item.lval);
+        throw std::runtime_error("cannot assign to constant: " + item.lval->name);
       }
-      GenerateExpr(*item.expr);
-      StoreToSymbol(symbol, "t0");
+      GenerateLValAddress(*item.lval);
+      EmitStoreStack(out_, "t0", TempOffset(0));
+      GenerateExpr(*item.expr, 1);
+      EmitLoadStack(out_, "t1", TempOffset(0));
+      StoreAddressed("t1", "t0");
       break;
     }
     case BlockItem::Kind::Return:
@@ -1016,10 +1418,24 @@ void RiscvGenerator::GenerateExpr(const Expr &expr, int depth) {
   }
   if (const auto *lval = dynamic_cast<const LValExpr *>(&expr)) {
     const Symbol &symbol = LookupSymbol(lval->name);
-    if (symbol.kind == Symbol::Kind::Const) {
+    if (symbol.kind == Symbol::Kind::Const && symbol.dimensions.empty()) {
       out_ << "  li t0, " << symbol.const_value << "\n";
     } else {
-      LoadFromSymbol(symbol, "t0");
+      GenerateLValAddress(*lval, depth);
+      const size_t used = lval->indices.size();
+      const bool scalar = symbol.is_pointer ? used > symbol.dimensions.size()
+                                           : used >= symbol.dimensions.size();
+      if (scalar) {
+        LoadAddressed("t0", "t0");
+      } else if (!symbol.is_pointer || used > 0) {
+        out_ << "  li t1, 0\n";
+        const int stride = TypeSize(symbol.dimensions, used + 1);
+        if (stride != 1) {
+          out_ << "  li t2, " << stride << "\n";
+          out_ << "  mul t1, t1, t2\n";
+        }
+        out_ << "  add t0, t0, t1\n";
+      }
     }
     return;
   }
@@ -1109,14 +1525,28 @@ void RiscvGenerator::GenerateExpr(const Expr &expr, int depth) {
       out_ << "  snez t0, t0\n";
       break;
     case BinaryOp::And:
-      out_ << "  snez t1, t1\n";
-      out_ << "  snez t0, t0\n";
-      out_ << "  and t0, t1, t0\n";
-      break;
     case BinaryOp::Or:
-      out_ << "  or t0, t1, t0\n";
-      out_ << "  snez t0, t0\n";
       break;
+  }
+}
+
+void RiscvGenerator::GenerateLValAddress(const LValExpr &lval, int depth) {
+  const Symbol &symbol = LookupSymbol(lval.name);
+  if (symbol.is_pointer) {
+    LoadFromSymbol(symbol, "t0");
+  } else {
+    LoadSymbolAddress(symbol, "t0");
+  }
+  for (size_t i = 0; i < lval.indices.size(); ++i) {
+    EmitStoreStack(out_, "t0", TempOffset(depth));
+    GenerateExpr(*lval.indices[i], depth + 1);
+    out_ << "  mv t1, t0\n";
+    const size_t dim_index = symbol.is_pointer ? i : i + 1;
+    const int stride = TypeSize(symbol.dimensions, dim_index);
+    out_ << "  li t2, " << stride << "\n";
+    out_ << "  mul t1, t1, t2\n";
+    EmitLoadStack(out_, "t0", TempOffset(depth));
+    out_ << "  add t0, t0, t1\n";
   }
 }
 
@@ -1143,13 +1573,37 @@ void RiscvGenerator::GenerateCond(const Expr &expr, const std::string &true_labe
   out_ << "  j " << false_label << "\n";
 }
 
+std::vector<int> RiscvGenerator::EvalDimensions(
+    const std::vector<std::unique_ptr<Expr>> &dimensions) const {
+  std::vector<int> result;
+  for (const auto &dimension : dimensions) {
+    result.push_back(EvalConstExpr(*dimension));
+  }
+  return result;
+}
+
+void RiscvGenerator::GenerateLocalArrayInit(const Symbol &symbol, const InitVal &init, int depth) {
+  const std::vector<const Expr *> exprs = FlattenInitExprs(init, symbol.dimensions);
+  for (size_t i = 0; i < exprs.size(); ++i) {
+    Symbol elem = symbol;
+    elem.dimensions.clear();
+    elem.stack_offset = symbol.stack_offset + static_cast<int>(i) * 4;
+    if (exprs[i] != nullptr) {
+      GenerateExpr(*exprs[i], depth);
+    } else {
+      out_ << "  li t0, 0\n";
+    }
+    StoreToSymbol(elem, "t0");
+  }
+}
+
 int RiscvGenerator::EvalConstExpr(const Expr &expr) const {
   if (const auto *number = dynamic_cast<const NumberExpr *>(&expr)) {
     return number->value;
   }
   if (const auto *lval = dynamic_cast<const LValExpr *>(&expr)) {
     const Symbol &symbol = LookupSymbol(lval->name);
-    if (symbol.kind != Symbol::Kind::Const) {
+    if (symbol.kind != Symbol::Kind::Const || !symbol.dimensions.empty() || !lval->indices.empty()) {
       throw std::runtime_error("variable is not allowed in constant expression: " + lval->name);
     }
     return symbol.const_value;
@@ -1250,7 +1704,7 @@ void RiscvGenerator::EmitReturn() {
 }
 
 void RiscvGenerator::StoreToSymbol(const Symbol &symbol, const std::string &reg) {
-  if (symbol.kind == Symbol::Kind::GlobalVar) {
+  if (symbol.kind == Symbol::Kind::GlobalVar || (!symbol.asm_name.empty())) {
     out_ << "  la t1, " << symbol.asm_name << "\n";
     out_ << "  sw " << reg << ", 0(t1)\n";
   } else {
@@ -1259,11 +1713,32 @@ void RiscvGenerator::StoreToSymbol(const Symbol &symbol, const std::string &reg)
 }
 
 void RiscvGenerator::LoadFromSymbol(const Symbol &symbol, const std::string &reg) {
-  if (symbol.kind == Symbol::Kind::GlobalVar) {
+  if (symbol.kind == Symbol::Kind::GlobalVar || (!symbol.asm_name.empty())) {
     out_ << "  la " << reg << ", " << symbol.asm_name << "\n";
     out_ << "  lw " << reg << ", 0(" << reg << ")\n";
   } else {
     EmitLoadStack(out_, reg, symbol.stack_offset);
+  }
+}
+
+void RiscvGenerator::StoreAddressed(const std::string &addr_reg, const std::string &value_reg) {
+  out_ << "  sw " << value_reg << ", 0(" << addr_reg << ")\n";
+}
+
+void RiscvGenerator::LoadAddressed(const std::string &addr_reg, const std::string &value_reg) {
+  out_ << "  lw " << value_reg << ", 0(" << addr_reg << ")\n";
+}
+
+void RiscvGenerator::LoadSymbolAddress(const Symbol &symbol, const std::string &reg) {
+  if (symbol.kind == Symbol::Kind::GlobalVar || (symbol.kind == Symbol::Kind::Const && !symbol.asm_name.empty())) {
+    out_ << "  la " << reg << ", " << symbol.asm_name << "\n";
+  } else {
+    if (Fits12Bit(symbol.stack_offset)) {
+      out_ << "  addi " << reg << ", sp, " << symbol.stack_offset << "\n";
+    } else {
+      out_ << "  li " << reg << ", " << symbol.stack_offset << "\n";
+      out_ << "  add " << reg << ", sp, " << reg << "\n";
+    }
   }
 }
 

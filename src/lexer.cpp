@@ -164,6 +164,10 @@ Token Lexer::ReadPunct() {
       return {TokenKind::LBrace, "{"};
     case '}':
       return {TokenKind::RBrace, "}"};
+    case '[':
+      return {TokenKind::LBracket, "["};
+    case ']':
+      return {TokenKind::RBracket, "]"};
     case ';':
       return {TokenKind::Semicolon, ";"};
     case ',':

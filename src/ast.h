@@ -17,7 +17,13 @@ enum class BinaryOp {
 struct Expr { virtual ~Expr() = default; };
 
 struct NumberExpr final : Expr { explicit NumberExpr(int value) : value(value) {} int value; };
-struct LValExpr final : Expr { explicit LValExpr(std::string name) : name(std::move(name)) {} std::string name; };
+struct LValExpr final : Expr {
+  explicit LValExpr(std::string name) : name(std::move(name)) {}
+  LValExpr(std::string name, std::vector<std::unique_ptr<Expr>> indices)
+      : name(std::move(name)), indices(std::move(indices)) {}
+  std::string name;
+  std::vector<std::unique_ptr<Expr>> indices;
+};
 struct CallExpr final : Expr {
   CallExpr(std::string name, std::vector<std::unique_ptr<Expr>> args)
       : name(std::move(name)), args(std::move(args)) {}
@@ -34,16 +40,35 @@ struct BinaryExpr final : Expr {
   BinaryOp op; std::unique_ptr<Expr> lhs; std::unique_ptr<Expr> rhs;
 };
 
-struct ConstDef { std::string name; std::unique_ptr<Expr> init; };
-struct VarDef { std::string name; std::unique_ptr<Expr> init; };
-struct Param { std::string name; };
+struct InitVal {
+  bool is_list = false;
+  std::unique_ptr<Expr> expr;
+  std::vector<InitVal> list;
+};
+
+struct ConstDef {
+  std::string name;
+  std::vector<std::unique_ptr<Expr>> dimensions;
+  InitVal init;
+};
+struct VarDef {
+  std::string name;
+  std::vector<std::unique_ptr<Expr>> dimensions;
+  bool has_init = false;
+  InitVal init;
+};
+struct Param {
+  std::string name;
+  bool is_array = false;
+  std::vector<std::unique_ptr<Expr>> dimensions;
+};
 
 struct Block;
 struct BlockItem {
   enum class Kind { ConstDecl, VarDecl, Assign, Return, ExprStmt, Block, If, While, Break, Continue } kind;
   std::vector<ConstDef> const_defs;
   std::vector<VarDef> var_defs;
-  std::string lval;
+  std::unique_ptr<LValExpr> lval;
   std::unique_ptr<Expr> expr;
   std::unique_ptr<Block> block;
   std::unique_ptr<BlockItem> then_stmt;

@@ -17,11 +17,20 @@ struct Symbol {
   std::string ir_name;
   std::string asm_name;
   int stack_offset = 0;
+  std::vector<int> dimensions;
+  bool is_pointer = false;
 };
 
 struct FuncInfo {
   TypeKind return_type = TypeKind::Int;
   int param_count = 0;
+};
+
+struct KoopaAddrInfo {
+  std::string ptr;
+  std::vector<int> remaining_dimensions;
+  bool from_pointer = false;
+  int indices_used = 0;
 };
 
 class KoopaGenerator {
@@ -45,8 +54,11 @@ class KoopaGenerator {
   void GenerateIf(const BlockItem &item);
   void GenerateWhile(const BlockItem &item);
   std::string GenerateExpr(const Expr &expr);
+  KoopaAddrInfo GenerateLValAddress(const LValExpr &lval);
   void GenerateCond(const Expr &expr, const std::string &true_label,
                     const std::string &false_label);
+  std::vector<int> EvalDimensions(const std::vector<std::unique_ptr<Expr>> &dimensions) const;
+  void GenerateLocalArrayInit(const Symbol &symbol, const InitVal &init);
   int EvalConstExpr(const Expr &expr) const;
   void PushScope();
   void PopScope();
@@ -99,8 +111,11 @@ class RiscvGenerator {
   std::string CurrentLoopEntry() const;
   std::string CurrentLoopEnd() const;
   void GenerateExpr(const Expr &expr, int depth = 0);
+  void GenerateLValAddress(const LValExpr &lval, int depth = 0);
   void GenerateCond(const Expr &expr, const std::string &true_label,
                     const std::string &false_label, int depth = 0);
+  std::vector<int> EvalDimensions(const std::vector<std::unique_ptr<Expr>> &dimensions) const;
+  void GenerateLocalArrayInit(const Symbol &symbol, const InitVal &init, int depth);
   int EvalConstExpr(const Expr &expr) const;
   void PushScope();
   void PopScope();
@@ -112,6 +127,9 @@ class RiscvGenerator {
   void EmitReturn();
   void StoreToSymbol(const Symbol &symbol, const std::string &reg);
   void LoadFromSymbol(const Symbol &symbol, const std::string &reg);
+  void StoreAddressed(const std::string &addr_reg, const std::string &value_reg);
+  void LoadAddressed(const std::string &addr_reg, const std::string &value_reg);
+  void LoadSymbolAddress(const Symbol &symbol, const std::string &reg);
   std::string NewLabel(const std::string &hint);
   static int AlignTo16(int bytes);
 

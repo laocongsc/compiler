@@ -70,12 +70,26 @@ std::unique_ptr<FunctionDef> Parser::ParseFuncDef(TypeKind return_type,
 std::vector<Param> Parser::ParseFuncFParams() {
   std::vector<Param> params;
   while (true) {
-    Expect(TokenKind::Int, "'int'");
-    params.push_back(Param{Expect(TokenKind::Ident, "parameter name").text});
+    params.push_back(ParseFuncFParam());
     if (!Match(TokenKind::Comma)) {
       return params;
     }
   }
+}
+
+Param Parser::ParseFuncFParam() {
+  Expect(TokenKind::Int, "'int'");
+  Param param;
+  param.name = Expect(TokenKind::Ident, "parameter name").text;
+  if (Match(TokenKind::LBracket)) {
+    param.is_array = true;
+    Expect(TokenKind::RBracket, "']'");
+    while (Match(TokenKind::LBracket)) {
+      param.dimensions.push_back(ParseExp());
+      Expect(TokenKind::RBracket, "']'");
+    }
+  }
+  return param;
 }
 
 std::vector<std::unique_ptr<Expr>> Parser::ParseFuncRParams() {
@@ -116,8 +130,9 @@ BlockItem Parser::ParseConstDecl() {
   while (true) {
     ConstDef def;
     def.name = Expect(TokenKind::Ident, "constant name").text;
+    def.dimensions = ParseDimensions();
     Expect(TokenKind::Assign, "'='");
-    def.init = ParseExp();
+    def.init = ParseInitVal();
     item.const_defs.push_back(std::move(def));
     if (!Match(TokenKind::Comma)) {
       break;
@@ -142,8 +157,10 @@ BlockItem Parser::ParseVarDecl(bool type_consumed, std::string first_name) {
       def.name = Expect(TokenKind::Ident, "variable name").text;
     }
     first = false;
+    def.dimensions = ParseDimensions();
     if (Match(TokenKind::Assign)) {
-      def.init = ParseExp();
+      def.has_init = true;
+      def.init = ParseInitVal();
     }
     item.var_defs.push_back(std::move(def));
     if (!Match(TokenKind::Comma)) {
@@ -202,19 +219,61 @@ BlockItem Parser::ParseStmt() {
     item.kind = BlockItem::Kind::ExprStmt;
     return item;
   }
-  if (Peek().kind == TokenKind::Ident && Peek(1).kind == TokenKind::Assign) {
-    item.kind = BlockItem::Kind::Assign;
-    item.lval = Expect(TokenKind::Ident, "assignment target").text;
-    Expect(TokenKind::Assign, "'='");
-    item.expr = ParseExp();
-    Expect(TokenKind::Semicolon, "';'");
-    return item;
+  if (Peek().kind == TokenKind::Ident) {
+    const size_t saved_pos = pos_;
+    std::unique_ptr<LValExpr> lval = ParseLVal();
+    if (Match(TokenKind::Assign)) {
+      item.kind = BlockItem::Kind::Assign;
+      item.lval = std::move(lval);
+      item.expr = ParseExp();
+      Expect(TokenKind::Semicolon, "';'");
+      return item;
+    }
+    pos_ = saved_pos;
   }
 
   item.kind = BlockItem::Kind::ExprStmt;
   item.expr = ParseExp();
   Expect(TokenKind::Semicolon, "';'");
   return item;
+}
+
+std::vector<std::unique_ptr<Expr>> Parser::ParseDimensions() {
+  std::vector<std::unique_ptr<Expr>> dimensions;
+  while (Match(TokenKind::LBracket)) {
+    dimensions.push_back(ParseExp());
+    Expect(TokenKind::RBracket, "']'");
+  }
+  return dimensions;
+}
+
+std::unique_ptr<LValExpr> Parser::ParseLVal() {
+  std::string name = Expect(TokenKind::Ident, "identifier").text;
+  std::vector<std::unique_ptr<Expr>> indices;
+  while (Match(TokenKind::LBracket)) {
+    indices.push_back(ParseExp());
+    Expect(TokenKind::RBracket, "']'");
+  }
+  return std::make_unique<LValExpr>(std::move(name), std::move(indices));
+}
+
+InitVal Parser::ParseInitVal() {
+  InitVal init;
+  if (Match(TokenKind::LBrace)) {
+    init.is_list = true;
+    if (Peek().kind != TokenKind::RBrace) {
+      while (true) {
+        init.list.push_back(ParseInitVal());
+        if (!Match(TokenKind::Comma)) {
+          break;
+        }
+      }
+    }
+    Expect(TokenKind::RBrace, "'}'");
+    return init;
+  }
+  init.expr = ParseExp();
+  return init;
 }
 
 std::unique_ptr<Expr> Parser::ParseExp() { return ParseLOrExp(); }
@@ -336,7 +395,7 @@ std::unique_ptr<Expr> Parser::ParsePrimaryExp() {
     return expr;
   }
   if (Peek().kind == TokenKind::Ident) {
-    return std::make_unique<LValExpr>(Expect(TokenKind::Ident, "identifier").text);
+    return ParseLVal();
   }
   return std::make_unique<NumberExpr>(
       Expect(TokenKind::Number, "integer constant, identifier or '('").value);

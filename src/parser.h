@@ -20,6 +20,7 @@ class Parser {
   std::unique_ptr<FunctionDef> ParseFuncDef(TypeKind return_type,
                                             std::string name);
   std::vector<Param> ParseFuncFParams();
+  Param ParseFuncFParam();
   std::vector<std::unique_ptr<Expr>> ParseFuncRParams();
   std::unique_ptr<Block> ParseBlock();
   BlockItem ParseBlockItem();
@@ -27,6 +28,9 @@ class Parser {
   BlockItem ParseVarDecl(bool type_consumed = false,
                          std::string first_name = "");
   BlockItem ParseStmt();
+  std::vector<std::unique_ptr<Expr>> ParseDimensions();
+  std::unique_ptr<LValExpr> ParseLVal();
+  InitVal ParseInitVal();
 
   std::unique_ptr<Expr> ParseExp();
   std::unique_ptr<Expr> ParseLOrExp();
