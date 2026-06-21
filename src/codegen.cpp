@@ -58,28 +58,55 @@ void KoopaGenerator::CollectAllocs(const BlockItem &item) {
         const std::string ir_name = NewAllocName(def.name);
         var_alloc_names_.emplace(&def, ir_name);
         alloc_lines_.push_back("  " + ir_name + " = alloc i32\n");
+        if (def.init) {
+          CollectLogicTemps(*def.init);
+        }
       }
       break;
     case BlockItem::Kind::Block:
       CollectAllocs(*item.block);
       break;
     case BlockItem::Kind::If:
+      CollectLogicTemps(*item.expr);
       CollectAllocs(*item.then_stmt);
       if (item.else_stmt) {
         CollectAllocs(*item.else_stmt);
       }
       break;
     case BlockItem::Kind::While:
+      CollectLogicTemps(*item.expr);
       CollectAllocs(*item.body_stmt);
       break;
     case BlockItem::Kind::ConstDecl:
     case BlockItem::Kind::Assign:
     case BlockItem::Kind::Return:
     case BlockItem::Kind::ExprStmt:
+      if (item.expr) {
+        CollectLogicTemps(*item.expr);
+      }
+      break;
     case BlockItem::Kind::Break:
     case BlockItem::Kind::Continue:
       break;
   }
+}
+
+void KoopaGenerator::CollectLogicTemps(const Expr &expr) {
+  if (const auto *unary = dynamic_cast<const UnaryExpr *>(&expr)) {
+    CollectLogicTemps(*unary->operand);
+    return;
+  }
+  const auto *binary = dynamic_cast<const BinaryExpr *>(&expr);
+  if (binary == nullptr) {
+    return;
+  }
+  if (binary->op == BinaryOp::And || binary->op == BinaryOp::Or) {
+    const std::string ir_name = NewAllocName("logic");
+    logic_alloc_names_.emplace(binary, ir_name);
+    alloc_lines_.push_back("  " + ir_name + " = alloc i32\n");
+  }
+  CollectLogicTemps(*binary->lhs);
+  CollectLogicTemps(*binary->rhs);
 }
 
 void KoopaGenerator::GenerateBlock(const Block &block) {
@@ -255,6 +282,50 @@ std::string KoopaGenerator::GenerateExpr(const Expr &expr) {
     throw std::runtime_error("unknown expression node");
   }
 
+  if (binary->op == BinaryOp::And) {
+    const auto found = logic_alloc_names_.find(binary);
+    if (found == logic_alloc_names_.end()) {
+      throw std::runtime_error("internal error: missing logic temp");
+    }
+    const std::string rhs_label = NewBlockName("land_val_rhs");
+    const std::string end_label = NewBlockName("land_val_end");
+    out_ << "  store 0, " << found->second << "\n";
+    GenerateCond(*binary->lhs, rhs_label, end_label);
+    out_ << rhs_label << ":\n";
+    entry_terminated_ = false;
+    const std::string rhs_value = GenerateExpr(*binary->rhs);
+    const std::string rhs_bool = EmitBinary("ne", rhs_value, "0");
+    out_ << "  store " << rhs_bool << ", " << found->second << "\n";
+    out_ << "  jump " << end_label << "\n";
+    out_ << end_label << ":\n";
+    entry_terminated_ = false;
+    const std::string result = NewValueName();
+    out_ << "  " << result << " = load " << found->second << "\n";
+    return result;
+  }
+
+  if (binary->op == BinaryOp::Or) {
+    const auto found = logic_alloc_names_.find(binary);
+    if (found == logic_alloc_names_.end()) {
+      throw std::runtime_error("internal error: missing logic temp");
+    }
+    const std::string rhs_label = NewBlockName("lor_val_rhs");
+    const std::string end_label = NewBlockName("lor_val_end");
+    out_ << "  store 1, " << found->second << "\n";
+    GenerateCond(*binary->lhs, end_label, rhs_label);
+    out_ << rhs_label << ":\n";
+    entry_terminated_ = false;
+    const std::string rhs_value = GenerateExpr(*binary->rhs);
+    const std::string rhs_bool = EmitBinary("ne", rhs_value, "0");
+    out_ << "  store " << rhs_bool << ", " << found->second << "\n";
+    out_ << "  jump " << end_label << "\n";
+    out_ << end_label << ":\n";
+    entry_terminated_ = false;
+    const std::string result = NewValueName();
+    out_ << "  " << result << " = load " << found->second << "\n";
+    return result;
+  }
+
   const std::string lhs = GenerateExpr(*binary->lhs);
   const std::string rhs = GenerateExpr(*binary->rhs);
   switch (binary->op) {
@@ -280,16 +351,9 @@ std::string KoopaGenerator::GenerateExpr(const Expr &expr) {
       return EmitBinary("eq", lhs, rhs);
     case BinaryOp::Ne:
       return EmitBinary("ne", lhs, rhs);
-    case BinaryOp::And: {
-      const std::string lhs_bool = EmitBinary("ne", lhs, "0");
-      const std::string rhs_bool = EmitBinary("ne", rhs, "0");
-      return EmitBinary("and", lhs_bool, rhs_bool);
-    }
-    case BinaryOp::Or: {
-      const std::string lhs_bool = EmitBinary("ne", lhs, "0");
-      const std::string rhs_bool = EmitBinary("ne", rhs, "0");
-      return EmitBinary("or", lhs_bool, rhs_bool);
-    }
+    case BinaryOp::And:
+    case BinaryOp::Or:
+      break;
   }
   throw std::runtime_error("unknown binary operator");
 }
