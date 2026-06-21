@@ -36,6 +36,9 @@ void KoopaGenerator::Generate(const Program &program) {
   out_ << "fun @main(): i32 {\n";
   out_ << "%entry:\n";
   for (const BlockItem &item : program.items) {
+    if (entry_terminated_) {
+      break;
+    }
     GenerateItem(item);
   }
   out_ << "}\n";
@@ -72,6 +75,7 @@ void KoopaGenerator::GenerateItem(const BlockItem &item) {
     case BlockItem::Kind::Return:
       const std::string value = GenerateExpr(*item.expr);
       out_ << "  ret " << value << "\n";
+      entry_terminated_ = true;
       break;
   }
 }

@@ -38,6 +38,7 @@ class KoopaGenerator {
   std::unordered_map<std::string, Symbol> symbols_;
   int next_value_id_ = 0;
   int next_alloc_id_ = 0;
+  bool entry_terminated_ = false;
 };
 
 class RiscvGenerator {
