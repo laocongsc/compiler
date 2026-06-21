@@ -34,10 +34,52 @@ void EmitStoreStack(std::ostream &out, const std::string &reg, int offset) {
 KoopaGenerator::KoopaGenerator(std::ostream &out) : out_(out) {}
 
 void KoopaGenerator::Generate(const Program &program) {
+  CollectAllocs(*program.block);
+
   out_ << "fun @main(): i32 {\n";
   out_ << "%entry:\n";
+  for (const std::string &line : alloc_lines_) {
+    out_ << line;
+  }
   GenerateBlock(*program.block);
   out_ << "}\n";
+}
+
+void KoopaGenerator::CollectAllocs(const Block &block) {
+  for (const BlockItem &item : block.items) {
+    CollectAllocs(item);
+  }
+}
+
+void KoopaGenerator::CollectAllocs(const BlockItem &item) {
+  switch (item.kind) {
+    case BlockItem::Kind::VarDecl:
+      for (const VarDef &def : item.var_defs) {
+        const std::string ir_name = NewAllocName(def.name);
+        var_alloc_names_.emplace(&def, ir_name);
+        alloc_lines_.push_back("  " + ir_name + " = alloc i32\n");
+      }
+      break;
+    case BlockItem::Kind::Block:
+      CollectAllocs(*item.block);
+      break;
+    case BlockItem::Kind::If:
+      CollectAllocs(*item.then_stmt);
+      if (item.else_stmt) {
+        CollectAllocs(*item.else_stmt);
+      }
+      break;
+    case BlockItem::Kind::While:
+      CollectAllocs(*item.body_stmt);
+      break;
+    case BlockItem::Kind::ConstDecl:
+    case BlockItem::Kind::Assign:
+    case BlockItem::Kind::Return:
+    case BlockItem::Kind::ExprStmt:
+    case BlockItem::Kind::Break:
+    case BlockItem::Kind::Continue:
+      break;
+  }
 }
 
 void KoopaGenerator::GenerateBlock(const Block &block) {
@@ -61,8 +103,12 @@ void KoopaGenerator::GenerateItem(const BlockItem &item) {
       break;
     case BlockItem::Kind::VarDecl:
       for (const VarDef &def : item.var_defs) {
-        const std::string ir_name = NewAllocName(def.name);
-        out_ << "  " << ir_name << " = alloc i32\n";
+        const auto found = var_alloc_names_.find(&def);
+        if (found == var_alloc_names_.end()) {
+          throw std::runtime_error("internal error: missing alloc for variable " +
+                                   def.name);
+        }
+        const std::string &ir_name = found->second;
         if (def.init) {
           const std::string value = GenerateExpr(*def.init);
           out_ << "  store " << value << ", " << ir_name << "\n";

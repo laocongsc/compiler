@@ -24,6 +24,8 @@ class KoopaGenerator {
   void Generate(const Program &program);
 
  private:
+  void CollectAllocs(const Block &block);
+  void CollectAllocs(const BlockItem &item);
   void GenerateBlock(const Block &block);
   void GenerateItem(const BlockItem &item);
   void GenerateIf(const BlockItem &item);
@@ -45,6 +47,8 @@ class KoopaGenerator {
 
   std::ostream &out_;
   std::vector<std::unordered_map<std::string, Symbol>> scopes_;
+  std::unordered_map<const VarDef *, std::string> var_alloc_names_;
+  std::vector<std::string> alloc_lines_;
   int next_value_id_ = 0;
   int next_alloc_id_ = 0;
   int next_block_id_ = 0;
@@ -63,6 +67,8 @@ class RiscvGenerator {
   void ScanBlock(const Block &block);
   void ScanItem(const BlockItem &item);
   void ScanExpr(const Expr &expr, int depth);
+  void CollectAllocs(const Block &block);
+  void CollectAllocs(const BlockItem &item);
   void GenerateBlock(const Block &block);
   void GenerateItem(const BlockItem &item);
   void GenerateIf(const BlockItem &item);
