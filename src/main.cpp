@@ -5,6 +5,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "ast_opt.h"
 #include "codegen.h"
 #include "lexer.h"
 #include "parser.h"
@@ -60,6 +61,7 @@ int main(int argc, char **argv) {
     Lexer lexer(ReadFile(options.input));
     Parser parser(lexer.Tokenize());
     const std::unique_ptr<Program> program = parser.ParseCompUnit();
+    OptimizeAst(*program);
     if (options.mode == "-koopa") {
       WriteKoopa(options.output, *program);
     } else {
