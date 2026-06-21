@@ -203,9 +203,9 @@ Options ParseArgs(int argc, char **argv) {
   Options options;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
-    if (arg == "-koopa") {
+    if (arg == "-koopa" || arg == "-riscv" || arg == "-perf") {
       if (++i >= argc) {
-        throw std::runtime_error("missing input after -koopa");
+        throw std::runtime_error("missing input after " + arg);
       }
       options.mode = arg;
       options.input = argv[i];
@@ -219,9 +219,11 @@ Options ParseArgs(int argc, char **argv) {
     }
   }
 
-  if (options.mode != "-koopa" || options.input.empty() ||
-      options.output.empty()) {
-    throw std::runtime_error("usage: compiler -koopa <input> -o <output>");
+  if ((options.mode != "-koopa" && options.mode != "-riscv" &&
+       options.mode != "-perf") ||
+      options.input.empty() || options.output.empty()) {
+    throw std::runtime_error(
+        "usage: compiler <-koopa|-riscv|-perf> <input> -o <output>");
   }
   return options;
 }
@@ -247,13 +249,29 @@ void WriteKoopa(const std::string &path, int return_value) {
   out << "}\n";
 }
 
+void WriteRiscv(const std::string &path, int return_value) {
+  std::ofstream out(path);
+  if (!out) {
+    throw std::runtime_error("failed to open output file: " + path);
+  }
+  out << "  .text\n";
+  out << "  .globl main\n";
+  out << "main:\n";
+  out << "  li a0, " << return_value << "\n";
+  out << "  ret\n";
+}
+
 int main(int argc, char **argv) {
   try {
     const Options options = ParseArgs(argc, argv);
     Lexer lexer(ReadFile(options.input));
     Parser parser(lexer.Tokenize());
     const int return_value = parser.ParseCompUnit();
-    WriteKoopa(options.output, return_value);
+    if (options.mode == "-koopa") {
+      WriteKoopa(options.output, return_value);
+    } else {
+      WriteRiscv(options.output, return_value);
+    }
     return 0;
   } catch (const std::exception &err) {
     std::cerr << "compiler: " << err.what() << '\n';
