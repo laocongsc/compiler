@@ -13,6 +13,29 @@ namespace {
 
 bool Fits12Bit(int value) { return value >= -2048 && value <= 2047; }
 
+std::string LocKey(SourceLocation loc) {
+  return std::to_string(loc.line) + ":" + std::to_string(loc.column);
+}
+
+const BlockItem *SingleInnerItem(const BlockItem &item) {
+  if (item.kind == BlockItem::Kind::Block) {
+    if (item.block == nullptr || item.block->items.size() != 1) {
+      return nullptr;
+    }
+    return &item.block->items.front();
+  }
+  return &item;
+}
+
+const BlockItem *SingleAssignItem(const BlockItem &item) {
+  const BlockItem *inner = SingleInnerItem(item);
+  if (inner == nullptr || inner->kind != BlockItem::Kind::Assign ||
+      inner->lval == nullptr || inner->expr == nullptr) {
+    return nullptr;
+  }
+  return inner;
+}
+
 void EmitLoadStack(std::ostream &out, const std::string &reg, int offset) {
   if (Fits12Bit(offset)) {
     out << "  lw " << reg << ", " << offset << "(sp)\n";
@@ -276,6 +299,10 @@ std::string OptimizeAsm(const std::string &asm_text) {
 }  // namespace
 
 KoopaGenerator::KoopaGenerator(std::ostream &out) : out_(out) {}
+
+KoopaGenerator::KoopaGenerator(std::ostream &out,
+                               std::unordered_set<std::string> rewrite_if_locs)
+    : out_(out), rewrite_if_locs_(std::move(rewrite_if_locs)) {}
 
 void KoopaGenerator::Generate(const Program &program) {
   RegisterLibraryFunctions();
@@ -678,6 +705,9 @@ void KoopaGenerator::GenerateItem(const BlockItem &item) {
 }
 
 void KoopaGenerator::GenerateIf(const BlockItem &item) {
+  if (TryGenerateRewriteIf(item)) {
+    return;
+  }
   const std::string then_label = NewBlockName("then");
   const std::string end_label = NewBlockName("end");
   const std::string else_label = item.else_stmt ? NewBlockName("else") : end_label;
@@ -710,6 +740,38 @@ void KoopaGenerator::GenerateIf(const BlockItem &item) {
 
   out_ << end_label << ":\n";
   entry_terminated_ = false;
+}
+
+bool KoopaGenerator::TryGenerateRewriteIf(const BlockItem &item) {
+  if (rewrite_if_locs_.count(LocKey(item.loc)) == 0 || item.else_stmt == nullptr) {
+    return false;
+  }
+  const BlockItem *then_assign = SingleAssignItem(*item.then_stmt);
+  const BlockItem *else_assign = SingleAssignItem(*item.else_stmt);
+  if (then_assign == nullptr || else_assign == nullptr) {
+    return false;
+  }
+
+  const Symbol &symbol = LookupSymbol(then_assign->lval->name);
+  if (symbol.kind == Symbol::Kind::Const || !then_assign->lval->indices.empty() ||
+      !else_assign->lval->indices.empty() ||
+      then_assign->lval->name != else_assign->lval->name) {
+    return false;
+  }
+
+  const std::string cond_value = GenerateExpr(*item.expr);
+  const std::string cond_bool = EmitBinary("ne", cond_value, "0");
+  const std::string mask = EmitBinary("sub", "0", cond_bool);
+  const std::string not_mask = EmitBinary("xor", mask, "-1");
+  const std::string then_value = GenerateExpr(*then_assign->expr);
+  const std::string else_value = GenerateExpr(*else_assign->expr);
+  const std::string masked_then = EmitBinary("and", then_value, mask);
+  const std::string masked_else = EmitBinary("and", else_value, not_mask);
+  const std::string selected = EmitBinary("or", masked_then, masked_else);
+  const KoopaAddrInfo addr = GenerateLValAddress(*then_assign->lval);
+  out_ << "  store " << selected << ", " << addr.ptr << "\n";
+  entry_terminated_ = false;
+  return true;
 }
 
 void KoopaGenerator::GenerateWhile(const BlockItem &item) {
@@ -1979,6 +2041,16 @@ void WriteKoopa(const std::string &path, const Program &program) {
     throw std::runtime_error("failed to open output file: " + path);
   }
   KoopaGenerator generator(out);
+  generator.Generate(program);
+}
+
+void WriteKoopaRewrite(const std::string &path, const Program &program,
+                       std::unordered_set<std::string> rewrite_if_locs) {
+  std::ofstream out(path);
+  if (!out) {
+    throw std::runtime_error("failed to open output file: " + path);
+  }
+  KoopaGenerator generator(out, std::move(rewrite_if_locs));
   generator.Generate(program);
 }
 

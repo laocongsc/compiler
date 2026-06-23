@@ -3,6 +3,7 @@
 #include <iosfwd>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "ast.h"
@@ -43,6 +44,7 @@ struct KoopaAddrInfo {
 class KoopaGenerator {
  public:
   explicit KoopaGenerator(std::ostream &out);
+  KoopaGenerator(std::ostream &out, std::unordered_set<std::string> rewrite_if_locs);
 
   void Generate(const Program &program);
 
@@ -59,6 +61,7 @@ class KoopaGenerator {
   void GenerateBlock(const Block &block);
   void GenerateItem(const BlockItem &item);
   void GenerateIf(const BlockItem &item);
+  bool TryGenerateRewriteIf(const BlockItem &item);
   void GenerateWhile(const BlockItem &item);
   std::string GenerateExpr(const Expr &expr);
   KoopaAddrInfo GenerateLValAddress(const LValExpr &lval);
@@ -93,6 +96,7 @@ class KoopaGenerator {
   TypeKind current_return_type_ = TypeKind::Int;
   std::vector<std::string> loop_entry_labels_;
   std::vector<std::string> loop_end_labels_;
+  std::unordered_set<std::string> rewrite_if_locs_;
 };
 
 class RiscvGenerator {
@@ -164,4 +168,6 @@ class RiscvGenerator {
 };
 
 void WriteKoopa(const std::string &path, const Program &program);
+void WriteKoopaRewrite(const std::string &path, const Program &program,
+                       std::unordered_set<std::string> rewrite_if_locs);
 void WriteRiscv(const std::string &path, const Program &program);

@@ -7,6 +7,7 @@
 
 #include "ast_opt.h"
 #include "codegen.h"
+#include "ct_rewrite.h"
 #include "leak_detect.h"
 #include "lexer.h"
 #include "parser.h"
@@ -22,7 +23,7 @@ Options ParseArgs(int argc, char **argv) {
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "-koopa" || arg == "-riscv" || arg == "-perf" ||
-        arg == "-detect") {
+        arg == "-detect" || arg == "-rewrite-koopa") {
       if (++i >= argc) {
         throw std::runtime_error("missing input after " + arg);
       }
@@ -39,12 +40,38 @@ Options ParseArgs(int argc, char **argv) {
   }
 
   if ((options.mode != "-koopa" && options.mode != "-riscv" &&
-       options.mode != "-perf" && options.mode != "-detect") ||
+       options.mode != "-perf" && options.mode != "-detect" &&
+       options.mode != "-rewrite-koopa") ||
       options.input.empty() || options.output.empty()) {
     throw std::runtime_error(
-        "usage: compiler <-koopa|-riscv|-perf|-detect> <input> -o <output>");
+        "usage: compiler <-koopa|-riscv|-perf|-detect|-rewrite-koopa> <input> -o <output>");
   }
   return options;
+}
+
+
+void WriteLeakReport(std::ostream &out, const LeakReport &leak) {
+  std::ostringstream line;
+  line << "warning[" << SeverityName(leak.severity) << "]: "
+       << LeakKindName(leak.kind) << " in function " << leak.function
+       << " at " << leak.loc.line << ':' << leak.loc.column << ": "
+       << leak.message;
+  out << line.str() << '\n';
+  std::cerr << line.str() << '\n';
+  if (!leak.reason.empty()) {
+    const std::string reason = "  reason: " + leak.reason;
+    out << reason << '\n';
+    std::cerr << reason << '\n';
+  }
+}
+
+void WriteRewriteDecision(std::ostream &out, const RewriteDecision &decision) {
+  WriteLeakReport(out, decision.report);
+  const std::string rewrite = std::string("  rewrite: ") +
+                              (decision.supported ? "supported, " : "unsupported, ") +
+                              decision.reason;
+  out << rewrite << '\n';
+  std::cerr << rewrite << '\n';
 }
 
 std::string ReadFile(const std::string &path) {
@@ -70,19 +97,25 @@ int main(int argc, char **argv) {
         throw std::runtime_error("failed to open output file: " + options.output);
       }
       for (const LeakReport &leak : leaks) {
-        std::ostringstream line;
-        line << "warning[" << SeverityName(leak.severity) << "]: "
-             << LeakKindName(leak.kind) << " in function " << leak.function
-             << " at " << leak.loc.line << ':' << leak.loc.column << ": "
-             << leak.message;
-        out << line.str() << '\n';
-        std::cerr << line.str() << '\n';
-        if (!leak.reason.empty()) {
-          const std::string reason = "  reason: " + leak.reason;
-          out << reason << '\n';
-          std::cerr << reason << '\n';
-        }
+        WriteLeakReport(out, leak);
       }
+      return 0;
+    }
+    if (options.mode == "-rewrite-koopa") {
+      const std::vector<LeakReport> leaks = DetectSideChannelLeaks(*program);
+      RewritePlan plan = BuildRewritePlan(*program, leaks);
+      if (!plan.AllSupported()) {
+        std::ofstream out(options.output);
+        if (!out) {
+          throw std::runtime_error("failed to open output file: " + options.output);
+        }
+        for (const RewriteDecision &decision : plan.decisions) {
+          WriteRewriteDecision(out, decision);
+        }
+        return 1;
+      }
+      OptimizeAst(*program);
+      WriteKoopaRewrite(options.output, *program, std::move(plan.conditional_assign_locs));
       return 0;
     }
     OptimizeAst(*program);
