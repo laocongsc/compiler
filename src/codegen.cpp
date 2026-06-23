@@ -9,6 +9,8 @@
 #include <stdexcept>
 #include <utility>
 
+#include "koopa.h"
+
 namespace {
 
 bool Fits12Bit(int value) { return value >= -2048 && value <= 2047; }
@@ -56,7 +58,17 @@ void EmitStoreStack(std::ostream &out, const std::string &reg, int offset) {
   out << "  sw " << reg << ", 0(t2)\n";
 }
 
-std::string ToAsmName(const std::string &name) { return name; }
+
+std::string StripPrefix(const char *name) {
+  if (name == nullptr) {
+    return "";
+  }
+  std::string result(name);
+  if (!result.empty() && (result[0] == '@' || result[0] == '%')) {
+    result.erase(result.begin());
+  }
+  return result;
+}
 
 int Product(const std::vector<int> &dims, size_t start = 0) {
   int result = 1;
@@ -64,10 +76,6 @@ int Product(const std::vector<int> &dims, size_t start = 0) {
     result *= dims[i];
   }
   return result;
-}
-
-int TypeSize(const std::vector<int> &dims, size_t start = 0) {
-  return Product(dims, start) * 4;
 }
 
 std::string ArrayTypeName(const std::vector<int> &dims, size_t start = 0) {
@@ -168,7 +176,6 @@ Symbol GlobalScalarSymbol(const std::string &name) {
   Symbol symbol;
   symbol.kind = Symbol::Kind::GlobalVar;
   symbol.ir_name = "@" + name;
-  symbol.asm_name = name;
   return symbol;
 }
 
@@ -214,6 +221,16 @@ bool ParseJump(const std::string &line, std::string *target) {
   return true;
 }
 
+bool IsUnconditionalTerminator(const std::string &line) {
+  const std::string trimmed = TrimLeft(line);
+  return trimmed == "ret" || trimmed.rfind("j ", 0) == 0;
+}
+
+bool IsSectionOrGlobalDirective(const std::string &line) {
+  const std::string trimmed = TrimLeft(line);
+  return trimmed == ".text" || trimmed == ".data" || trimmed.rfind(".globl", 0) == 0;
+}
+
 bool ParseLoadStore(const std::string &line, std::string *op,
                     std::string *reg, std::string *addr) {
   const std::string trimmed = TrimLeft(line);
@@ -244,7 +261,16 @@ std::string OptimizeAsm(const std::string &asm_text) {
 
   std::vector<std::string> optimized;
   optimized.reserve(lines.size());
+  bool unreachable = false;
   for (size_t i = 0; i < lines.size(); ++i) {
+    if (unreachable) {
+      if (IsLabelLine(lines[i]) || IsSectionOrGlobalDirective(lines[i])) {
+        unreachable = false;
+      } else {
+        continue;
+      }
+    }
+
     std::string jump_target;
     std::string next_label;
     if (i + 1 < lines.size() && ParseJump(lines[i], &jump_target) &&
@@ -287,6 +313,9 @@ std::string OptimizeAsm(const std::string &asm_text) {
     }
 
     optimized.push_back(lines[i]);
+    if (IsUnconditionalTerminator(lines[i])) {
+      unreachable = true;
+    }
   }
 
   std::ostringstream out;
@@ -379,7 +408,6 @@ void KoopaGenerator::GenerateGlobalItem(const GlobalItem &item) {
           Symbol symbol;
           symbol.kind = Symbol::Kind::Const;
           symbol.ir_name = "@" + def.name;
-          symbol.asm_name = def.name;
           symbol.dimensions = dims;
           InsertSymbol(def.name, std::move(symbol));
         }
@@ -413,7 +441,6 @@ void KoopaGenerator::GenerateGlobalItem(const GlobalItem &item) {
           Symbol symbol;
           symbol.kind = Symbol::Kind::GlobalVar;
           symbol.ir_name = "@" + def.name;
-          symbol.asm_name = def.name;
           symbol.dimensions = dims;
           InsertSymbol(def.name, std::move(symbol));
         }
@@ -1164,1033 +1191,905 @@ std::string KoopaGenerator::JoinArgs(const std::vector<std::string> &args) {
   return result;
 }
 
-// RISC-V backend.
 
-RiscvGenerator::RiscvGenerator(std::ostream &out) : out_(out) {}
+class KoopaRawRiscvGenerator {
+ public:
+  explicit KoopaRawRiscvGenerator(std::ostream &out) : out_(out) {}
 
-RiscvGenerator::RiscvGenerator(
-    std::ostream &out, std::unordered_set<std::string> rewrite_if_locs,
-    std::unordered_set<std::string> rewrite_array_lookup_locs,
-    std::unordered_set<std::string> rewrite_logic_expr_locs)
-    : out_(out),
-      rewrite_if_locs_(std::move(rewrite_if_locs)),
-      rewrite_array_lookup_locs_(std::move(rewrite_array_lookup_locs)),
-      rewrite_logic_expr_locs_(std::move(rewrite_logic_expr_locs)) {}
-
-void RiscvGenerator::Generate(const Program &program) {
-  RegisterLibraryFunctions();
-  RegisterFunctions(program);
-  scopes_.clear();
-  PushScope();
-
-  bool has_data = false;
-  for (const GlobalItem &item : program.items) {
-    if (item.kind == GlobalItem::Kind::ConstDecl || item.kind == GlobalItem::Kind::VarDecl) {
-      bool emits_data = false;
-      if (item.kind == GlobalItem::Kind::VarDecl) {
-        emits_data = true;
-      } else {
-        for (const ConstDef &def : item.const_defs) {
-          if (!def.dimensions.empty()) {
-            emits_data = true;
-          }
-        }
+  void Generate(const koopa_raw_program_t &program) {
+    if (program.values.len > 0) {
+      out_ << "  .data\n";
+      for (uint32_t i = 0; i < program.values.len; ++i) {
+        GenerateGlobal(reinterpret_cast<koopa_raw_value_t>(program.values.buffer[i]));
       }
-      if (!has_data && emits_data) {
-        out_ << "  .data\n";
-        has_data = true;
+    }
+
+    out_ << "  .text\n";
+    for (uint32_t i = 0; i < program.funcs.len; ++i) {
+      const auto func = reinterpret_cast<koopa_raw_function_t>(program.funcs.buffer[i]);
+      if (func->bbs.len != 0) {
+        GenerateFunction(func);
       }
-      GenerateGlobalItem(item);
     }
   }
 
-  out_ << "  .text\n";
-  for (const GlobalItem &item : program.items) {
-    if (item.kind == GlobalItem::Kind::FuncDef) {
-      GenerateFunction(*item.function);
+ private:
+  int TypeSize(koopa_raw_type_t type) const {
+    switch (type->tag) {
+      case KOOPA_RTT_UNIT:
+        return 0;
+      case KOOPA_RTT_INT32:
+        return 4;
+      case KOOPA_RTT_POINTER:
+        return 4;
+      case KOOPA_RTT_ARRAY:
+        return static_cast<int>(type->data.array.len) * TypeSize(type->data.array.base);
+      case KOOPA_RTT_FUNCTION:
+        return 0;
+    }
+    throw std::runtime_error("unknown Koopa type");
+  }
+
+  int PointeeSize(koopa_raw_value_t ptr) const {
+    if (ptr->ty->tag != KOOPA_RTT_POINTER) {
+      throw std::runtime_error("Koopa value is not a pointer");
+    }
+    return TypeSize(ptr->ty->data.pointer.base);
+  }
+
+  int ElemPtrStride(koopa_raw_value_t src) const {
+    if (src->ty->tag != KOOPA_RTT_POINTER) {
+      throw std::runtime_error("getelemptr source is not a pointer");
+    }
+    koopa_raw_type_t base = src->ty->data.pointer.base;
+    if (base->tag == KOOPA_RTT_ARRAY) {
+      return TypeSize(base->data.array.base);
+    }
+    return TypeSize(base);
+  }
+
+  bool HasRuntimeValue(koopa_raw_value_t value) const {
+    return value->ty->tag != KOOPA_RTT_UNIT &&
+           value->kind.tag != KOOPA_RVT_INTEGER &&
+           value->kind.tag != KOOPA_RVT_ZERO_INIT &&
+           value->kind.tag != KOOPA_RVT_UNDEF &&
+           value->kind.tag != KOOPA_RVT_AGGREGATE &&
+           value->kind.tag != KOOPA_RVT_GLOBAL_ALLOC;
+  }
+
+  bool IsPureInst(koopa_raw_value_t value) const {
+    switch (value->kind.tag) {
+      case KOOPA_RVT_LOAD:
+      case KOOPA_RVT_GET_PTR:
+      case KOOPA_RVT_GET_ELEM_PTR:
+      case KOOPA_RVT_BINARY:
+        return true;
+      default:
+        return false;
     }
   }
 
-  PopScope();
-}
-
-void RiscvGenerator::RegisterLibraryFunctions() {
-  functions_.clear();
-  functions_.emplace("getint", FuncInfo{TypeKind::Int, 0});
-  functions_.emplace("getch", FuncInfo{TypeKind::Int, 0});
-  functions_.emplace("getarray", FuncInfo{TypeKind::Int, 1});
-  functions_.emplace("putint", FuncInfo{TypeKind::Void, 1});
-  functions_.emplace("putch", FuncInfo{TypeKind::Void, 1});
-  functions_.emplace("putarray", FuncInfo{TypeKind::Void, 2});
-  functions_.emplace("starttime", FuncInfo{TypeKind::Void, 0});
-  functions_.emplace("stoptime", FuncInfo{TypeKind::Void, 0});
-}
-
-void RiscvGenerator::RegisterFunctions(const Program &program) {
-  for (const GlobalItem &item : program.items) {
-    if (item.kind != GlobalItem::Kind::FuncDef) {
-      continue;
-    }
-    const FunctionDef &function = *item.function;
-    if (!functions_.emplace(function.name,
-                            FuncInfo{function.return_type,
-                                     static_cast<int>(function.params.size())})
-             .second) {
-      throw std::runtime_error("redefined function: " + function.name);
-    }
-  }
-}
-
-void RiscvGenerator::GenerateGlobalItem(const GlobalItem &item) {
-  switch (item.kind) {
-    case GlobalItem::Kind::ConstDecl:
-      for (const ConstDef &def : item.const_defs) {
-        const std::vector<int> dims = EvalDimensions(def.dimensions);
-        if (dims.empty()) {
-          InsertSymbol(def.name,
-                       ScalarConstSymbol(EvalConstExpr(*def.init.expr)));
-        } else {
-          const std::vector<const Expr *> exprs = FlattenInitExprs(def.init, dims);
-          out_ << "  .globl " << ToAsmName(def.name) << "\n";
-          out_ << ToAsmName(def.name) << ":\n";
-          for (const Expr *expr : exprs) {
-            out_ << "  .word " << (expr ? EvalConstExpr(*expr) : 0) << "\n";
-          }
-          Symbol symbol;
-          symbol.kind = Symbol::Kind::Const;
-          symbol.asm_name = ToAsmName(def.name);
-          symbol.dimensions = dims;
-          InsertSymbol(def.name, std::move(symbol));
-        }
-      }
-      break;
-    case GlobalItem::Kind::VarDecl:
-      for (const VarDef &def : item.var_defs) {
-        const std::vector<int> dims = EvalDimensions(def.dimensions);
-        out_ << "  .globl " << ToAsmName(def.name) << "\n";
-        out_ << ToAsmName(def.name) << ":\n";
-        if (dims.empty()) {
-          if (def.has_init) {
-            out_ << "  .word " << EvalConstExpr(*def.init.expr) << "\n";
-          } else {
-            out_ << "  .zero 4\n";
-          }
-          InsertSymbol(def.name,
-                       GlobalScalarSymbol(ToAsmName(def.name)));
-        } else {
-          if (def.has_init) {
-            const std::vector<const Expr *> exprs = FlattenInitExprs(def.init, dims);
-            for (const Expr *expr : exprs) {
-              out_ << "  .word " << (expr ? EvalConstExpr(*expr) : 0) << "\n";
-            }
-          } else {
-            out_ << "  .zero " << TypeSize(dims) << "\n";
-          }
-          Symbol symbol;
-          symbol.kind = Symbol::Kind::GlobalVar;
-          symbol.asm_name = ToAsmName(def.name);
-          symbol.dimensions = dims;
-          InsertSymbol(def.name, std::move(symbol));
-        }
-      }
-      break;
-    case GlobalItem::Kind::FuncDef:
-      break;
-  }
-}
-
-void RiscvGenerator::GenerateFunction(const FunctionDef &function) {
-  ResetFunctionState();
-  current_return_type_ = function.return_type;
-  ScanFunction(function);
-  local_bytes_ = next_var_offset_;
-  frame_size_ = AlignTo16(out_arg_bytes_ + local_bytes_ + max_temp_depth_ * 4 + (needs_ra_ ? 4 : 0));
-
-  scopes_.resize(1);
-  next_var_offset_ = out_arg_bytes_;
-  current_terminated_ = false;
-
-  out_ << "  .globl " << function.name << "\n";
-  out_ << function.name << ":\n";
-  EmitStackAdjust(-frame_size_);
-  if (needs_ra_) {
-    EmitStoreStack(out_, "ra", frame_size_ - 4);
+  bool IsDeadPureInst(koopa_raw_value_t value) const {
+    return IsPureInst(value) && live_values_.count(value) == 0;
   }
 
-  PushScope();
-  for (size_t i = 0; i < function.params.size(); ++i) {
-    const Param &param = function.params[i];
-    Symbol symbol;
-    symbol.kind = Symbol::Kind::Var;
-    symbol.stack_offset = next_var_offset_;
-    next_var_offset_ += 4;
-    symbol.dimensions = EvalDimensions(param.dimensions);
-    symbol.is_pointer = param.is_array;
-    symbol.cacheable = !param.is_array;
-    InsertSymbol(param.name, symbol);
-    if (i < 8) {
-      EmitStoreStack(out_, "a" + std::to_string(i), symbol.stack_offset);
-    } else {
-      EmitLoadStack(out_, "t0", frame_size_ + static_cast<int>(i - 8) * 4);
-      EmitStoreStack(out_, "t0", symbol.stack_offset);
-    }
-  }
-  GenerateBlock(*function.block);
-  PopScope();
-
-  if (!current_terminated_) {
-    if (function.return_type == TypeKind::Int) {
-      out_ << "  li a0, 0\n";
-    }
-    FlushAndClearRegCache();
-    EmitReturn();
-  }
-}
-
-void RiscvGenerator::ResetFunctionState() {
-  next_var_offset_ = 0;
-  local_bytes_ = 0;
-  out_arg_bytes_ = 0;
-  max_temp_depth_ = 0;
-  frame_size_ = 0;
-  needs_ra_ = false;
-  current_terminated_ = false;
-  loop_entry_labels_.clear();
-  loop_end_labels_.clear();
-  reg_cache_.clear();
-}
-
-void RiscvGenerator::ScanFunction(const FunctionDef &function) {
-  scopes_.resize(1);
-  PushScope();
-  for (const Param &param : function.params) {
-    Symbol symbol;
-    symbol.kind = Symbol::Kind::Var;
-    symbol.stack_offset = next_var_offset_;
-    next_var_offset_ += 4;
-    symbol.dimensions = EvalDimensions(param.dimensions);
-    symbol.is_pointer = param.is_array;
-    symbol.cacheable = !param.is_array;
-    InsertSymbol(param.name, symbol);
-  }
-  ScanBlock(*function.block);
-  PopScope();
-}
-
-void RiscvGenerator::ScanBlock(const Block &block) {
-  PushScope();
-  for (const BlockItem &item : block.items) {
-    ScanItem(item);
-  }
-  PopScope();
-}
-
-void RiscvGenerator::ScanItem(const BlockItem &item) {
-  switch (item.kind) {
-    case BlockItem::Kind::ConstDecl:
-      for (const ConstDef &def : item.const_defs) {
-        const std::vector<int> dims = EvalDimensions(def.dimensions);
-        if (dims.empty()) {
-          InsertSymbol(def.name,
-                       ScalarConstSymbol(EvalConstExpr(*def.init.expr)));
-        } else {
-          Symbol symbol;
-          symbol.kind = Symbol::Kind::Const;
-          symbol.stack_offset = next_var_offset_;
-          symbol.dimensions = dims;
-          next_var_offset_ += TypeSize(dims);
-          InsertSymbol(def.name, symbol);
-          for (const Expr *expr : FlattenInitExprs(def.init, dims)) {
-            if (expr != nullptr) {
-              ScanExpr(*expr, 0);
-            }
-          }
-        }
-      }
-      break;
-    case BlockItem::Kind::VarDecl:
-      for (const VarDef &def : item.var_defs) {
-        const std::vector<int> dims = EvalDimensions(def.dimensions);
-        if (def.has_init) {
-          if (dims.empty()) {
-            ScanExpr(*def.init.expr, 0);
-          } else {
-            for (const Expr *expr : FlattenInitExprs(def.init, dims)) {
-              if (expr != nullptr) {
-                ScanExpr(*expr, 0);
-              }
-            }
-          }
-        }
-        Symbol symbol;
-        symbol.kind = Symbol::Kind::Var;
-        symbol.stack_offset = next_var_offset_;
-        symbol.dimensions = dims;
-        next_var_offset_ += dims.empty() ? 4 : TypeSize(dims);
-        InsertSymbol(def.name, symbol);
-      }
-      break;
-    case BlockItem::Kind::Assign:
-      LookupSymbol(item.lval->name);
-      for (const auto &index : item.lval->indices) {
-        ScanExpr(*index, 0);
-      }
-      ScanExpr(*item.expr, 0);
-      break;
-    case BlockItem::Kind::Return:
-      if (item.expr) {
-        ScanExpr(*item.expr, 0);
-      }
-      break;
-    case BlockItem::Kind::ExprStmt:
-      if (item.expr) {
-        ScanExpr(*item.expr, 0);
-      }
-      break;
-    case BlockItem::Kind::Block:
-      ScanBlock(*item.block);
-      break;
-    case BlockItem::Kind::If:
-      ScanExpr(*item.expr, 0);
-      ScanItem(*item.then_stmt);
-      if (item.else_stmt) {
-        ScanItem(*item.else_stmt);
-      }
-      break;
-    case BlockItem::Kind::While:
-      ScanExpr(*item.expr, 0);
-      ScanItem(*item.body_stmt);
-      break;
-    case BlockItem::Kind::Break:
-    case BlockItem::Kind::Continue:
-      break;
-  }
-}
-
-void RiscvGenerator::ScanExpr(const Expr &expr, int depth) {
-  if (const auto *lval = dynamic_cast<const LValExpr *>(&expr)) {
-    LookupSymbol(lval->name);
-    for (const auto &index : lval->indices) {
-      ScanExpr(*index, depth);
-    }
-    max_temp_depth_ = std::max(max_temp_depth_, depth + 2);
-    return;
-  }
-  if (dynamic_cast<const NumberExpr *>(&expr) != nullptr) {
-    return;
-  }
-  if (const auto *call = dynamic_cast<const CallExpr *>(&expr)) {
-    needs_ra_ = true;
-    if (call->args.size() > 8) {
-      out_arg_bytes_ = std::max(out_arg_bytes_, static_cast<int>(call->args.size() - 8) * 4);
-    }
-    const int arg_count = static_cast<int>(call->args.size());
-    max_temp_depth_ = std::max(max_temp_depth_, depth + arg_count + 2);
-    for (const auto &arg : call->args) {
-      ScanExpr(*arg, depth + arg_count);
-    }
-    return;
-  }
-  if (const auto *unary = dynamic_cast<const UnaryExpr *>(&expr)) {
-    ScanExpr(*unary->operand, depth);
-    return;
-  }
-  const auto *binary = dynamic_cast<const BinaryExpr *>(&expr);
-  if (binary == nullptr) {
-    throw std::runtime_error("unknown expression node");
-  }
-  max_temp_depth_ = std::max(max_temp_depth_, depth + 1);
-  ScanExpr(*binary->lhs, depth);
-  ScanExpr(*binary->rhs, depth + 1);
-}
-
-void RiscvGenerator::GenerateBlock(const Block &block) {
-  PushScope();
-  for (const BlockItem &item : block.items) {
-    if (current_terminated_) {
-      break;
-    }
-    GenerateItem(item);
-  }
-  PopScope();
-}
-
-void RiscvGenerator::GenerateItem(const BlockItem &item) {
-  switch (item.kind) {
-    case BlockItem::Kind::ConstDecl:
-      for (const ConstDef &def : item.const_defs) {
-        const std::vector<int> dims = EvalDimensions(def.dimensions);
-        if (dims.empty()) {
-          InsertSymbol(def.name,
-                       ScalarConstSymbol(EvalConstExpr(*def.init.expr)));
-        } else {
-          Symbol symbol;
-          symbol.kind = Symbol::Kind::Const;
-          symbol.stack_offset = next_var_offset_;
-          symbol.dimensions = dims;
-          next_var_offset_ += TypeSize(dims);
-          InsertSymbol(def.name, symbol);
-          GenerateLocalArrayInit(symbol, def.init, 0);
-        }
-      }
-      break;
-    case BlockItem::Kind::VarDecl:
-      for (const VarDef &def : item.var_defs) {
-        const std::vector<int> dims = EvalDimensions(def.dimensions);
-        Symbol symbol;
-        symbol.kind = Symbol::Kind::Var;
-        symbol.stack_offset = next_var_offset_;
-        symbol.dimensions = dims;
-        symbol.cacheable = dims.empty();
-        next_var_offset_ += dims.empty() ? 4 : TypeSize(dims);
-        if (def.has_init) {
-          if (dims.empty()) {
-            GenerateExpr(*def.init.expr);
-            StoreToSymbol(symbol, "t0");
-          } else {
-            GenerateLocalArrayInit(symbol, def.init, 0);
-          }
-        }
-        InsertSymbol(def.name, symbol);
-      }
-      break;
-    case BlockItem::Kind::Assign: {
-      const Symbol &symbol = LookupSymbol(item.lval->name);
-      if (symbol.kind == Symbol::Kind::Const) {
-        throw std::runtime_error("cannot assign to constant: " + item.lval->name);
-      }
-      if (item.lval->indices.empty() && symbol.dimensions.empty() && !symbol.is_pointer) {
-        GenerateExpr(*item.expr);
-        StoreToSymbol(symbol, "t0");
-        break;
-      }
-      GenerateLValAddress(*item.lval);
-      EmitStoreStack(out_, "t0", TempOffset(0));
-      GenerateExpr(*item.expr, 1);
-      EmitLoadStack(out_, "t1", TempOffset(0));
-      StoreAddressed("t1", "t0");
-      break;
-    }
-    case BlockItem::Kind::Return:
-      if (item.expr) {
-        GenerateExpr(*item.expr);
-        out_ << "  mv a0, t0\n";
-      }
-      FlushAndClearRegCache();
-      EmitReturn();
-      current_terminated_ = true;
-      break;
-    case BlockItem::Kind::ExprStmt:
-      if (item.expr) {
-        GenerateExpr(*item.expr);
-      }
-      break;
-    case BlockItem::Kind::Block:
-      GenerateBlock(*item.block);
-      break;
-    case BlockItem::Kind::If:
-      GenerateIf(item);
-      break;
-    case BlockItem::Kind::While:
-      GenerateWhile(item);
-      break;
-    case BlockItem::Kind::Break:
-      FlushAndClearRegCache();
-      out_ << "  j " << CurrentLoopEnd() << "\n";
-      current_terminated_ = true;
-      break;
-    case BlockItem::Kind::Continue:
-      FlushAndClearRegCache();
-      out_ << "  j " << CurrentLoopEntry() << "\n";
-      current_terminated_ = true;
-      break;
-  }
-}
-
-void RiscvGenerator::GenerateIf(const BlockItem &item) {
-  if (TryGenerateRewriteIf(item)) {
-    return;
-  }
-  const std::string then_label = NewLabel("then");
-  const std::string end_label = NewLabel("end");
-  const std::string else_label = item.else_stmt ? NewLabel("else") : end_label;
-  GenerateCond(*item.expr, then_label, else_label);
-  out_ << then_label << ":\n";
-  ClearRegCache();
-  current_terminated_ = false;
-  GenerateItem(*item.then_stmt);
-  const bool then_terminated = current_terminated_;
-  if (!then_terminated) {
-    FlushAndClearRegCache();
-    out_ << "  j " << end_label << "\n";
-  }
-  bool else_terminated = false;
-  if (item.else_stmt) {
-    out_ << else_label << ":\n";
-    ClearRegCache();
-    current_terminated_ = false;
-    GenerateItem(*item.else_stmt);
-    else_terminated = current_terminated_;
-    if (!else_terminated) {
-      FlushAndClearRegCache();
-      out_ << "  j " << end_label << "\n";
-    }
-  }
-  if (item.else_stmt && then_terminated && else_terminated) {
-    current_terminated_ = true;
-    return;
-  }
-  out_ << end_label << ":\n";
-  ClearRegCache();
-  current_terminated_ = false;
-}
-
-
-bool RiscvGenerator::TryGenerateRewriteIf(const BlockItem &item) {
-  if (rewrite_if_locs_.count(LocKey(item.loc)) == 0 || item.else_stmt == nullptr) {
-    return false;
-  }
-  const BlockItem *then_assign = SingleAssignItem(*item.then_stmt);
-  const BlockItem *else_assign = SingleAssignItem(*item.else_stmt);
-  if (then_assign == nullptr || else_assign == nullptr) {
-    return false;
-  }
-  const Symbol &symbol = LookupSymbol(then_assign->lval->name);
-  if (symbol.kind == Symbol::Kind::Const || !symbol.dimensions.empty() ||
-      !then_assign->lval->indices.empty() || !else_assign->lval->indices.empty() ||
-      then_assign->lval->name != else_assign->lval->name) {
-    return false;
-  }
-
-  GenerateExpr(*item.expr, 0);
-  out_ << "  snez t0, t0\n";
-  out_ << "  sub t0, x0, t0\n";
-  EmitStoreStack(out_, "t0", TempOffset(0));
-  GenerateExpr(*then_assign->expr, 1);
-  EmitStoreStack(out_, "t0", TempOffset(1));
-  GenerateExpr(*else_assign->expr, 2);
-  EmitLoadStack(out_, "t1", TempOffset(0));
-  out_ << "  xori t2, t1, -1\n";
-  out_ << "  and t0, t0, t2\n";
-  EmitLoadStack(out_, "t2", TempOffset(1));
-  out_ << "  and t2, t2, t1\n";
-  out_ << "  or t0, t2, t0\n";
-  StoreToSymbol(symbol, "t0");
-  current_terminated_ = false;
-  return true;
-}
-
-bool RiscvGenerator::TryGenerateRewriteArrayLookup(const LValExpr &lval, int depth) {
-  if (rewrite_array_lookup_locs_.count(LocKey(lval.loc)) == 0) {
-    return false;
-  }
-  const Symbol &symbol = LookupSymbol(lval.name);
-  if (symbol.is_pointer || symbol.dimensions.size() != 1 || lval.indices.size() != 1) {
-    return false;
-  }
-  const int length = symbol.dimensions.front();
-  GenerateExpr(*lval.indices.front(), depth + 2);
-  EmitStoreStack(out_, "t0", TempOffset(depth));
-  out_ << "  li t0, 0\n";
-  EmitStoreStack(out_, "t0", TempOffset(depth + 1));
-  for (int i = 0; i < length; ++i) {
-    LoadSymbolAddress(symbol, "t0");
-    out_ << "  li t1, " << (i * 4) << "\n";
-    out_ << "  add t0, t0, t1\n";
-    LoadAddressed("t0", "t0");
-    EmitLoadStack(out_, "t1", TempOffset(depth));
-    out_ << "  li t2, " << i << "\n";
-    out_ << "  xor t1, t1, t2\n";
-    out_ << "  seqz t1, t1\n";
-    out_ << "  sub t1, x0, t1\n";
-    out_ << "  and t0, t0, t1\n";
-    EmitLoadStack(out_, "t2", TempOffset(depth + 1));
-    out_ << "  xori t1, t1, -1\n";
-    out_ << "  and t2, t2, t1\n";
-    out_ << "  or t0, t0, t2\n";
-    EmitStoreStack(out_, "t0", TempOffset(depth + 1));
-  }
-  EmitLoadStack(out_, "t0", TempOffset(depth + 1));
-  return true;
-}
-
-bool RiscvGenerator::TryGenerateRewriteLogicExpr(const BinaryExpr &expr, int depth) {
-  if (rewrite_logic_expr_locs_.count(LocKey(expr.loc)) == 0) {
-    return false;
-  }
-  if (expr.op != BinaryOp::And && expr.op != BinaryOp::Or) {
-    return false;
-  }
-  GenerateExpr(*expr.lhs, depth);
-  out_ << "  snez t0, t0\n";
-  EmitStoreStack(out_, "t0", TempOffset(depth));
-  GenerateExpr(*expr.rhs, depth + 1);
-  out_ << "  snez t0, t0\n";
-  EmitLoadStack(out_, "t1", TempOffset(depth));
-  out_ << "  " << (expr.op == BinaryOp::And ? "and" : "or") << " t0, t1, t0\n";
-  return true;
-}
-
-void RiscvGenerator::GenerateWhile(const BlockItem &item) {
-  const std::string entry_label = NewLabel("while_entry");
-  const std::string body_label = NewLabel("while_body");
-  const std::string end_label = NewLabel("while_end");
-  FlushAndClearRegCache();
-  out_ << "  j " << entry_label << "\n";
-  out_ << entry_label << ":\n";
-  ClearRegCache();
-  current_terminated_ = false;
-  GenerateCond(*item.expr, body_label, end_label);
-  out_ << body_label << ":\n";
-  ClearRegCache();
-  current_terminated_ = false;
-  loop_entry_labels_.push_back(entry_label);
-  loop_end_labels_.push_back(end_label);
-  GenerateItem(*item.body_stmt);
-  loop_entry_labels_.pop_back();
-  loop_end_labels_.pop_back();
-  if (!current_terminated_) {
-    FlushAndClearRegCache();
-    out_ << "  j " << entry_label << "\n";
-  }
-  out_ << end_label << ":\n";
-  ClearRegCache();
-  current_terminated_ = false;
-}
-
-std::string RiscvGenerator::CurrentLoopEntry() const {
-  if (loop_entry_labels_.empty()) {
-    throw std::runtime_error("continue outside loop");
-  }
-  return loop_entry_labels_.back();
-}
-
-std::string RiscvGenerator::CurrentLoopEnd() const {
-  if (loop_end_labels_.empty()) {
-    throw std::runtime_error("break outside loop");
-  }
-  return loop_end_labels_.back();
-}
-
-void RiscvGenerator::GenerateExpr(const Expr &expr, int depth) {
-  if (const auto *number = dynamic_cast<const NumberExpr *>(&expr)) {
-    out_ << "  li t0, " << number->value << "\n";
-    return;
-  }
-  if (const auto *lval = dynamic_cast<const LValExpr *>(&expr)) {
-    if (TryGenerateRewriteArrayLookup(*lval, depth)) {
+  void MarkValueLive(koopa_raw_value_t value) {
+    if (value == nullptr || live_values_.count(value) != 0) {
       return;
     }
-    const Symbol &symbol = LookupSymbol(lval->name);
-    if (symbol.kind == Symbol::Kind::Const && symbol.dimensions.empty()) {
-      out_ << "  li t0, " << symbol.const_value << "\n";
-    } else if (lval->indices.empty() && symbol.dimensions.empty() && !symbol.is_pointer) {
-      LoadFromSymbol(symbol, "t0");
-    } else {
-      GenerateLValAddress(*lval, depth);
-      const size_t used = lval->indices.size();
-      const bool scalar = symbol.is_pointer ? used > symbol.dimensions.size()
-                                           : used >= symbol.dimensions.size();
-      if (scalar) {
-        LoadAddressed("t0", "t0");
-      } else if (!symbol.is_pointer || used > 0) {
-        out_ << "  li t1, 0\n";
-        const int stride = TypeSize(symbol.dimensions, used + 1);
-        if (stride != 1) {
-          out_ << "  li t2, " << stride << "\n";
-          out_ << "  mul t1, t1, t2\n";
+    live_values_.insert(value);
+    switch (value->kind.tag) {
+      case KOOPA_RVT_LOAD:
+        MarkValueLive(value->kind.data.load.src);
+        break;
+      case KOOPA_RVT_STORE:
+        MarkValueLive(value->kind.data.store.value);
+        MarkValueLive(value->kind.data.store.dest);
+        break;
+      case KOOPA_RVT_GET_PTR:
+        MarkValueLive(value->kind.data.get_ptr.src);
+        MarkValueLive(value->kind.data.get_ptr.index);
+        break;
+      case KOOPA_RVT_GET_ELEM_PTR:
+        MarkValueLive(value->kind.data.get_elem_ptr.src);
+        MarkValueLive(value->kind.data.get_elem_ptr.index);
+        break;
+      case KOOPA_RVT_BINARY:
+        MarkValueLive(value->kind.data.binary.lhs);
+        MarkValueLive(value->kind.data.binary.rhs);
+        break;
+      case KOOPA_RVT_BRANCH:
+        MarkValueLive(value->kind.data.branch.cond);
+        break;
+      case KOOPA_RVT_CALL:
+        for (uint32_t i = 0; i < value->kind.data.call.args.len; ++i) {
+          MarkValueLive(reinterpret_cast<koopa_raw_value_t>(value->kind.data.call.args.buffer[i]));
         }
-        out_ << "  add t0, t0, t1\n";
+        break;
+      case KOOPA_RVT_RETURN:
+        MarkValueLive(value->kind.data.ret.value);
+        break;
+      default:
+        break;
+    }
+  }
+
+  void BuildLiveValues(koopa_raw_function_t func) {
+    live_values_.clear();
+    value_blocks_.clear();
+    for (uint32_t i = 0; i < func->bbs.len; ++i) {
+      const auto bb = reinterpret_cast<koopa_raw_basic_block_t>(func->bbs.buffer[i]);
+      for (uint32_t j = 0; j < bb->insts.len; ++j) {
+        const auto inst = reinterpret_cast<koopa_raw_value_t>(bb->insts.buffer[j]);
+        value_blocks_[inst] = bb;
       }
     }
-    return;
+    for (uint32_t i = 0; i < func->bbs.len; ++i) {
+      const auto bb = reinterpret_cast<koopa_raw_basic_block_t>(func->bbs.buffer[i]);
+      for (uint32_t j = 0; j < bb->insts.len; ++j) {
+        const auto inst = reinterpret_cast<koopa_raw_value_t>(bb->insts.buffer[j]);
+        switch (inst->kind.tag) {
+          case KOOPA_RVT_STORE:
+          case KOOPA_RVT_BRANCH:
+          case KOOPA_RVT_JUMP:
+          case KOOPA_RVT_CALL:
+          case KOOPA_RVT_RETURN:
+            MarkValueLive(inst);
+            break;
+          default:
+            break;
+        }
+      }
+    }
   }
-  if (const auto *call = dynamic_cast<const CallExpr *>(&expr)) {
-    const auto found = functions_.find(call->name);
-    if (found == functions_.end()) {
-      throw std::runtime_error("undefined function: " + call->name);
+
+  bool IsPromotableScalarAlloc(koopa_raw_value_t value) const {
+    if (value->kind.tag != KOOPA_RVT_ALLOC || value->ty->tag != KOOPA_RTT_POINTER ||
+        value->ty->data.pointer.base->tag != KOOPA_RTT_INT32) {
+      return false;
     }
-    const int arg_count = static_cast<int>(call->args.size());
-    for (size_t i = 0; i < call->args.size(); ++i) {
-      GenerateExpr(*call->args[i], depth + arg_count);
-      EmitStoreStack(out_, "t0", TempOffset(depth + static_cast<int>(i)));
+    for (uint32_t i = 0; i < value->used_by.len; ++i) {
+      const auto user = reinterpret_cast<koopa_raw_value_t>(value->used_by.buffer[i]);
+      if (user->kind.tag == KOOPA_RVT_LOAD && user->kind.data.load.src == value) {
+        continue;
+      }
+      if (user->kind.tag == KOOPA_RVT_STORE && user->kind.data.store.dest == value) {
+        continue;
+      }
+      return false;
     }
-    FlushAndClearRegCache();
-    for (size_t i = 0; i < call->args.size(); ++i) {
-      EmitLoadStack(out_, "t0", TempOffset(depth + static_cast<int>(i)));
+    return true;
+  }
+
+  bool IsCacheableRuntimeValue(koopa_raw_value_t value) const {
+    return HasRuntimeValue(value) && value->kind.tag != KOOPA_RVT_ALLOC &&
+           value->kind.tag != KOOPA_RVT_GLOBAL_ALLOC;
+  }
+
+  static const std::vector<std::string> &LinearScanRegs() {
+    static const std::vector<std::string> regs = {"t3", "t4", "t5", "t6"};
+    return regs;
+  }
+
+  int RemainingUses(koopa_raw_value_t value) const {
+    const auto found = remaining_uses_.find(value);
+    return found == remaining_uses_.end() ? 0 : found->second;
+  }
+
+  void CountValueUse(koopa_raw_value_t value) {
+    if (IsCacheableRuntimeValue(value)) {
+      ++remaining_uses_[value];
+    }
+  }
+
+  void CountInstUses(koopa_raw_value_t inst) {
+    switch (inst->kind.tag) {
+      case KOOPA_RVT_LOAD:
+        CountValueUse(inst->kind.data.load.src);
+        break;
+      case KOOPA_RVT_STORE:
+        CountValueUse(inst->kind.data.store.value);
+        CountValueUse(inst->kind.data.store.dest);
+        break;
+      case KOOPA_RVT_GET_PTR:
+        CountValueUse(inst->kind.data.get_ptr.src);
+        CountValueUse(inst->kind.data.get_ptr.index);
+        break;
+      case KOOPA_RVT_GET_ELEM_PTR:
+        CountValueUse(inst->kind.data.get_elem_ptr.src);
+        CountValueUse(inst->kind.data.get_elem_ptr.index);
+        break;
+      case KOOPA_RVT_BINARY:
+        CountValueUse(inst->kind.data.binary.lhs);
+        CountValueUse(inst->kind.data.binary.rhs);
+        break;
+      case KOOPA_RVT_BRANCH:
+        CountValueUse(inst->kind.data.branch.cond);
+        break;
+      case KOOPA_RVT_CALL:
+        for (uint32_t i = 0; i < inst->kind.data.call.args.len; ++i) {
+          CountValueUse(reinterpret_cast<koopa_raw_value_t>(inst->kind.data.call.args.buffer[i]));
+        }
+        break;
+      case KOOPA_RVT_RETURN:
+        if (inst->kind.data.ret.value != nullptr) {
+          CountValueUse(inst->kind.data.ret.value);
+        }
+        break;
+      default:
+        break;
+    }
+  }
+
+  template <typename Fn>
+  void ForEachOperand(koopa_raw_value_t inst, Fn fn) const {
+    switch (inst->kind.tag) {
+      case KOOPA_RVT_LOAD:
+        fn(inst->kind.data.load.src);
+        break;
+      case KOOPA_RVT_STORE:
+        fn(inst->kind.data.store.value);
+        fn(inst->kind.data.store.dest);
+        break;
+      case KOOPA_RVT_GET_PTR:
+        fn(inst->kind.data.get_ptr.src);
+        fn(inst->kind.data.get_ptr.index);
+        break;
+      case KOOPA_RVT_GET_ELEM_PTR:
+        fn(inst->kind.data.get_elem_ptr.src);
+        fn(inst->kind.data.get_elem_ptr.index);
+        break;
+      case KOOPA_RVT_BINARY:
+        fn(inst->kind.data.binary.lhs);
+        fn(inst->kind.data.binary.rhs);
+        break;
+      case KOOPA_RVT_BRANCH:
+        fn(inst->kind.data.branch.cond);
+        break;
+      case KOOPA_RVT_CALL:
+        for (uint32_t i = 0; i < inst->kind.data.call.args.len; ++i) {
+          fn(reinterpret_cast<koopa_raw_value_t>(inst->kind.data.call.args.buffer[i]));
+        }
+        break;
+      case KOOPA_RVT_RETURN:
+        if (inst->kind.data.ret.value != nullptr) {
+          fn(inst->kind.data.ret.value);
+        }
+        break;
+      default:
+        break;
+    }
+  }
+
+  bool AllAllocUsesInBlock(koopa_raw_value_t alloc, koopa_raw_basic_block_t bb) const {
+    for (uint32_t i = 0; i < alloc->used_by.len; ++i) {
+      const auto user = reinterpret_cast<koopa_raw_value_t>(alloc->used_by.buffer[i]);
+      const auto found = value_blocks_.find(user);
+      if (found == value_blocks_.end() || found->second != bb) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool AllUsesInBlock(koopa_raw_value_t value, koopa_raw_basic_block_t bb) const {
+    for (uint32_t i = 0; i < value->used_by.len; ++i) {
+      const auto user = reinterpret_cast<koopa_raw_value_t>(value->used_by.buffer[i]);
+      const auto found = value_blocks_.find(user);
+      if (found == value_blocks_.end() || found->second != bb) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool HasStoreValueUse(koopa_raw_value_t value) const {
+    for (uint32_t i = 0; i < value->used_by.len; ++i) {
+      const auto user = reinterpret_cast<koopa_raw_value_t>(value->used_by.buffer[i]);
+      if (user->kind.tag == KOOPA_RVT_STORE && user->kind.data.store.value == value) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool IntervalCrossesCall(int start, int last, const std::vector<int> &call_positions) const {
+    for (int call_pos : call_positions) {
+      if (start < call_pos && call_pos < last) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  void BuildBlockRegisterPlan(koopa_raw_basic_block_t bb) {
+    allocated_regs_.clear();
+    reg_only_values_.clear();
+
+    struct Interval {
+      koopa_raw_value_t value = nullptr;
+      int start = 0;
+      int last = 0;
+      std::string reg;
+    };
+
+    std::unordered_map<koopa_raw_value_t, int> starts;
+    std::unordered_map<koopa_raw_value_t, int> lasts;
+    std::unordered_map<koopa_raw_value_t, int> uses;
+    std::vector<int> call_positions;
+
+    for (uint32_t i = 0; i < bb->insts.len; ++i) {
+      const auto inst = reinterpret_cast<koopa_raw_value_t>(bb->insts.buffer[i]);
+      if (IsDeadPureInst(inst)) {
+        continue;
+      }
+      const int pos = static_cast<int>(i);
+      if (inst->kind.tag == KOOPA_RVT_CALL) {
+        call_positions.push_back(pos);
+      }
+      if (IsCacheableRuntimeValue(inst)) {
+        starts.emplace(inst, pos);
+      }
+      ForEachOperand(inst, [&](koopa_raw_value_t value) {
+        if (!IsCacheableRuntimeValue(value)) {
+          return;
+        }
+        const auto block = value_blocks_.find(value);
+        if (block == value_blocks_.end() || block->second != bb) {
+          return;
+        }
+        lasts[value] = pos;
+        ++uses[value];
+      });
+    }
+
+    std::vector<Interval> intervals;
+    for (const auto &entry : starts) {
+      koopa_raw_value_t value = entry.first;
+      const auto use_count = uses.find(value);
+      const auto last = lasts.find(value);
+      if (use_count == uses.end() || use_count->second == 0 || last == lasts.end()) {
+        continue;
+      }
+      const int start = entry.second;
+      if (IntervalCrossesCall(start, last->second, call_positions)) {
+        continue;
+      }
+      intervals.push_back(Interval{value, start, last->second, ""});
+    }
+
+    std::sort(intervals.begin(), intervals.end(), [](const Interval &lhs, const Interval &rhs) {
+      if (lhs.start != rhs.start) {
+        return lhs.start < rhs.start;
+      }
+      return lhs.last < rhs.last;
+    });
+
+    std::vector<Interval *> active;
+    std::vector<std::string> free_regs = LinearScanRegs();
+    for (Interval &interval : intervals) {
+      for (auto it = active.begin(); it != active.end();) {
+        if ((*it)->last < interval.start) {
+          free_regs.push_back((*it)->reg);
+          it = active.erase(it);
+        } else {
+          ++it;
+        }
+      }
+
+      if (!free_regs.empty()) {
+        interval.reg = free_regs.back();
+        free_regs.pop_back();
+      } else {
+        auto spill = std::max_element(active.begin(), active.end(),
+                                      [](const Interval *lhs, const Interval *rhs) {
+                                        return lhs->last < rhs->last;
+                                      });
+        if (spill != active.end() && (*spill)->last > interval.last) {
+          interval.reg = (*spill)->reg;
+          allocated_regs_.erase((*spill)->value);
+          reg_only_values_.erase((*spill)->value);
+          active.erase(spill);
+        }
+      }
+
+      if (interval.reg.empty()) {
+        continue;
+      }
+      allocated_regs_[interval.value] = interval.reg;
+      if (AllUsesInBlock(interval.value, bb) && !HasStoreValueUse(interval.value)) {
+        reg_only_values_.insert(interval.value);
+      }
+      active.push_back(&interval);
+      std::sort(active.begin(), active.end(), [](const Interval *lhs, const Interval *rhs) {
+        return lhs->last < rhs->last;
+      });
+    }
+  }
+
+  void PrepareBlock(koopa_raw_basic_block_t bb) {
+    ClearValueCache();
+    BuildBlockRegisterPlan(bb);
+    remaining_uses_.clear();
+    alloc_current_values_.clear();
+    local_promotable_allocs_.clear();
+    for (koopa_raw_value_t alloc : promotable_allocs_) {
+      if (AllAllocUsesInBlock(alloc, bb)) {
+        local_promotable_allocs_.insert(alloc);
+      }
+    }
+    for (uint32_t i = 0; i < bb->insts.len; ++i) {
+      const auto inst = reinterpret_cast<koopa_raw_value_t>(bb->insts.buffer[i]);
+      if (!IsDeadPureInst(inst)) {
+        CountInstUses(inst);
+      }
+    }
+  }
+
+  const std::string *FindCachedValue(koopa_raw_value_t value) const {
+    const auto found = value_regs_.find(value);
+    if (found == value_regs_.end()) {
+      return nullptr;
+    }
+    return &found->second;
+  }
+
+  void ClearValueCache() {
+    value_regs_.clear();
+  }
+
+  void ForgetRegister(const std::string &reg) {
+    for (auto it = value_regs_.begin(); it != value_regs_.end();) {
+      if (it->second == reg) {
+        it = value_regs_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+
+  void CacheValue(koopa_raw_value_t value, const std::string &src_reg) {
+    const auto assigned = allocated_regs_.find(value);
+    if (assigned == allocated_regs_.end()) {
+      return;
+    }
+    const std::string &reg = assigned->second;
+    ForgetRegister(reg);
+    value_regs_[value] = reg;
+    if (reg != src_reg) {
+      out_ << "  mv " << reg << ", " << src_reg << "\n";
+    }
+  }
+
+  int StackOffset(koopa_raw_value_t value) const {
+    const auto found = value_offsets_.find(value);
+    if (found == value_offsets_.end()) {
+      throw std::runtime_error("missing stack slot for Koopa value");
+    }
+    return out_arg_bytes_ + found->second;
+  }
+
+  void AssignSlot(koopa_raw_value_t value, int bytes) {
+    if (bytes <= 0) {
+      return;
+    }
+    value_offsets_.emplace(value, local_bytes_);
+    local_bytes_ += bytes;
+  }
+
+  std::string LabelName(koopa_raw_basic_block_t bb) const {
+    return ".L" + current_function_ + "_" + StripPrefix(bb->name);
+  }
+
+  void EmitLi(const std::string &reg, int value) {
+    out_ << "  li " << reg << ", " << value << "\n";
+  }
+
+  void EmitStackAddr(const std::string &reg, int offset) {
+    if (Fits12Bit(offset)) {
+      out_ << "  addi " << reg << ", sp, " << offset << "\n";
+      return;
+    }
+    out_ << "  li " << reg << ", " << offset << "\n";
+    out_ << "  add " << reg << ", sp, " << reg << "\n";
+  }
+
+  void EmitStackAdjust(int bytes) {
+    if (bytes == 0) {
+      return;
+    }
+    if (Fits12Bit(bytes)) {
+      out_ << "  addi sp, sp, " << bytes << "\n";
+      return;
+    }
+    out_ << "  li t0, " << bytes << "\n";
+    out_ << "  add sp, sp, t0\n";
+  }
+
+  void EmitLoadValue(koopa_raw_value_t value, const std::string &reg) {
+    switch (value->kind.tag) {
+      case KOOPA_RVT_INTEGER:
+        EmitLi(reg, value->kind.data.integer.value);
+        return;
+      case KOOPA_RVT_GLOBAL_ALLOC:
+        out_ << "  la " << reg << ", " << StripPrefix(value->name) << "\n";
+        return;
+      case KOOPA_RVT_ALLOC:
+        EmitStackAddr(reg, StackOffset(value));
+        return;
+      default:
+        if (const std::string *cached = FindCachedValue(value)) {
+          if (*cached != reg) {
+            out_ << "  mv " << reg << ", " << *cached << "\n";
+          }
+          return;
+        }
+        EmitLoadStack(out_, reg, StackOffset(value));
+        return;
+    }
+  }
+
+  void EmitStoreValue(koopa_raw_value_t value, const std::string &reg) {
+    if (!HasRuntimeValue(value)) {
+      return;
+    }
+    CacheValue(value, reg);
+    if (reg_only_values_.count(value) == 0) {
+      EmitStoreStack(out_, reg, StackOffset(value));
+    }
+  }
+
+  void EmitReturn() {
+    if (needs_ra_) {
+      EmitLoadStack(out_, "ra", frame_size_ - 4);
+    }
+    EmitStackAdjust(frame_size_);
+    out_ << "  ret\n";
+  }
+
+  void ScanFunction(koopa_raw_function_t func) {
+    BuildLiveValues(func);
+    value_offsets_.clear();
+    promotable_allocs_.clear();
+    ClearValueCache();
+    local_bytes_ = 0;
+    out_arg_bytes_ = 0;
+    needs_ra_ = false;
+    frame_size_ = 0;
+
+    for (uint32_t i = 0; i < func->params.len; ++i) {
+      AssignSlot(reinterpret_cast<koopa_raw_value_t>(func->params.buffer[i]), 4);
+    }
+
+    for (uint32_t i = 0; i < func->bbs.len; ++i) {
+      const auto bb = reinterpret_cast<koopa_raw_basic_block_t>(func->bbs.buffer[i]);
+      for (uint32_t j = 0; j < bb->insts.len; ++j) {
+        const auto inst = reinterpret_cast<koopa_raw_value_t>(bb->insts.buffer[j]);
+        if (IsDeadPureInst(inst)) {
+          continue;
+        }
+        if (inst->kind.tag == KOOPA_RVT_ALLOC) {
+          AssignSlot(inst, PointeeSize(inst));
+          if (IsPromotableScalarAlloc(inst)) {
+            promotable_allocs_.insert(inst);
+          }
+        } else if (HasRuntimeValue(inst)) {
+          AssignSlot(inst, 4);
+        }
+        if (inst->kind.tag == KOOPA_RVT_CALL) {
+          needs_ra_ = true;
+          const int argc = static_cast<int>(inst->kind.data.call.args.len);
+          if (argc > 8) {
+            out_arg_bytes_ = std::max(out_arg_bytes_, (argc - 8) * 4);
+          }
+        }
+      }
+    }
+    frame_size_ = AlignTo16(out_arg_bytes_ + local_bytes_ + (needs_ra_ ? 4 : 0));
+  }
+
+  void GenerateFunction(koopa_raw_function_t func) {
+    current_function_ = StripPrefix(func->name);
+    ScanFunction(func);
+
+    out_ << "  .globl " << current_function_ << "\n";
+    out_ << current_function_ << ":\n";
+    EmitStackAdjust(-frame_size_);
+    if (needs_ra_) {
+      EmitStoreStack(out_, "ra", frame_size_ - 4);
+    }
+
+    for (uint32_t i = 0; i < func->params.len; ++i) {
+      const auto param = reinterpret_cast<koopa_raw_value_t>(func->params.buffer[i]);
+      if (i < 8) {
+        EmitStoreStack(out_, "a" + std::to_string(i), StackOffset(param));
+      } else {
+        EmitLoadStack(out_, "t0", frame_size_ + static_cast<int>(i - 8) * 4);
+        EmitStoreStack(out_, "t0", StackOffset(param));
+      }
+    }
+
+    for (uint32_t i = 0; i < func->bbs.len; ++i) {
+      const auto bb = reinterpret_cast<koopa_raw_basic_block_t>(func->bbs.buffer[i]);
+      PrepareBlock(bb);
+      out_ << LabelName(bb) << ":\n";
+      for (uint32_t j = 0; j < bb->insts.len; ++j) {
+        GenerateInst(reinterpret_cast<koopa_raw_value_t>(bb->insts.buffer[j]));
+      }
+    }
+  }
+
+  void GenerateInst(koopa_raw_value_t inst) {
+    if (IsDeadPureInst(inst)) {
+      return;
+    }
+    switch (inst->kind.tag) {
+      case KOOPA_RVT_ALLOC:
+        break;
+      case KOOPA_RVT_LOAD:
+        GenerateLoad(inst);
+        break;
+      case KOOPA_RVT_STORE:
+        GenerateStore(inst);
+        break;
+      case KOOPA_RVT_GET_PTR:
+        GenerateGetPtr(inst);
+        break;
+      case KOOPA_RVT_GET_ELEM_PTR:
+        GenerateGetElemPtr(inst);
+        break;
+      case KOOPA_RVT_BINARY:
+        GenerateBinary(inst);
+        break;
+      case KOOPA_RVT_BRANCH:
+        GenerateBranch(inst);
+        break;
+      case KOOPA_RVT_JUMP:
+        out_ << "  j " << LabelName(inst->kind.data.jump.target) << "\n";
+        break;
+      case KOOPA_RVT_CALL:
+        GenerateCall(inst);
+        break;
+      case KOOPA_RVT_RETURN:
+        if (inst->kind.data.ret.value != nullptr) {
+          EmitLoadValue(inst->kind.data.ret.value, "a0");
+        }
+        EmitReturn();
+        break;
+      default:
+        throw std::runtime_error("unsupported Koopa instruction in RISC-V backend");
+    }
+  }
+
+  void GenerateLoad(koopa_raw_value_t inst) {
+    const koopa_raw_value_t src = inst->kind.data.load.src;
+    const auto forwarded = alloc_current_values_.find(src);
+    if (forwarded != alloc_current_values_.end()) {
+      EmitLoadValue(forwarded->second, "t0");
+      EmitStoreValue(inst, "t0");
+      return;
+    }
+    EmitLoadValue(src, "t0");
+    out_ << "  lw t0, 0(t0)\n";
+    EmitStoreValue(inst, "t0");
+  }
+
+  void GenerateStore(koopa_raw_value_t inst) {
+    const koopa_raw_value_t value = inst->kind.data.store.value;
+    const koopa_raw_value_t dest = inst->kind.data.store.dest;
+    EmitLoadValue(value, "t0");
+    if (local_promotable_allocs_.count(dest) != 0) {
+      alloc_current_values_[dest] = value;
+      return;
+    }
+    EmitLoadValue(dest, "t1");
+    out_ << "  sw t0, 0(t1)\n";
+  }
+
+  void GenerateGetPtr(koopa_raw_value_t inst) {
+    const auto &ptr = inst->kind.data.get_ptr;
+    EmitLoadValue(ptr.src, "t0");
+    EmitLoadValue(ptr.index, "t1");
+    const int stride = PointeeSize(ptr.src);
+    if (stride != 1) {
+      EmitLi("t2", stride);
+      out_ << "  mul t1, t1, t2\n";
+    }
+    out_ << "  add t0, t0, t1\n";
+    EmitStoreValue(inst, "t0");
+  }
+
+  void GenerateGetElemPtr(koopa_raw_value_t inst) {
+    const auto &ptr = inst->kind.data.get_elem_ptr;
+    EmitLoadValue(ptr.src, "t0");
+    EmitLoadValue(ptr.index, "t1");
+    const int stride = ElemPtrStride(ptr.src);
+    if (stride != 1) {
+      EmitLi("t2", stride);
+      out_ << "  mul t1, t1, t2\n";
+    }
+    out_ << "  add t0, t0, t1\n";
+    EmitStoreValue(inst, "t0");
+  }
+
+  void GenerateBinary(koopa_raw_value_t inst) {
+    const auto &binary = inst->kind.data.binary;
+    EmitLoadValue(binary.lhs, "t0");
+    EmitLoadValue(binary.rhs, "t1");
+    switch (binary.op) {
+      case KOOPA_RBO_ADD:
+        out_ << "  add t0, t0, t1\n";
+        break;
+      case KOOPA_RBO_SUB:
+        out_ << "  sub t0, t0, t1\n";
+        break;
+      case KOOPA_RBO_MUL:
+        out_ << "  mul t0, t0, t1\n";
+        break;
+      case KOOPA_RBO_DIV:
+        out_ << "  div t0, t0, t1\n";
+        break;
+      case KOOPA_RBO_MOD:
+        out_ << "  rem t0, t0, t1\n";
+        break;
+      case KOOPA_RBO_AND:
+        out_ << "  and t0, t0, t1\n";
+        break;
+      case KOOPA_RBO_OR:
+        out_ << "  or t0, t0, t1\n";
+        break;
+      case KOOPA_RBO_XOR:
+        out_ << "  xor t0, t0, t1\n";
+        break;
+      case KOOPA_RBO_SHL:
+        out_ << "  sll t0, t0, t1\n";
+        break;
+      case KOOPA_RBO_SHR:
+        out_ << "  srl t0, t0, t1\n";
+        break;
+      case KOOPA_RBO_SAR:
+        out_ << "  sra t0, t0, t1\n";
+        break;
+      case KOOPA_RBO_EQ:
+        out_ << "  xor t0, t0, t1\n";
+        out_ << "  seqz t0, t0\n";
+        break;
+      case KOOPA_RBO_NOT_EQ:
+        out_ << "  xor t0, t0, t1\n";
+        out_ << "  snez t0, t0\n";
+        break;
+      case KOOPA_RBO_LT:
+        out_ << "  slt t0, t0, t1\n";
+        break;
+      case KOOPA_RBO_GT:
+        out_ << "  sgt t0, t0, t1\n";
+        break;
+      case KOOPA_RBO_LE:
+        out_ << "  sgt t0, t0, t1\n";
+        out_ << "  seqz t0, t0\n";
+        break;
+      case KOOPA_RBO_GE:
+        out_ << "  slt t0, t0, t1\n";
+        out_ << "  seqz t0, t0\n";
+        break;
+    }
+    EmitStoreValue(inst, "t0");
+  }
+
+  void GenerateBranch(koopa_raw_value_t inst) {
+    const auto &branch = inst->kind.data.branch;
+    EmitLoadValue(branch.cond, "t0");
+    out_ << "  bnez t0, " << LabelName(branch.true_bb) << "\n";
+    out_ << "  j " << LabelName(branch.false_bb) << "\n";
+  }
+
+  void GenerateCall(koopa_raw_value_t inst) {
+    const auto &call = inst->kind.data.call;
+    for (uint32_t i = 0; i < call.args.len; ++i) {
+      const auto arg = reinterpret_cast<koopa_raw_value_t>(call.args.buffer[i]);
+      EmitLoadValue(arg, "t0");
       if (i < 8) {
         out_ << "  mv a" << i << ", t0\n";
       } else {
         EmitStoreStack(out_, "t0", static_cast<int>(i - 8) * 4);
       }
     }
-    out_ << "  call " << call->name << "\n";
-    if (found->second.return_type == TypeKind::Int) {
-      out_ << "  mv t0, a0\n";
-    } else {
-      out_ << "  li t0, 0\n";
+    ClearValueCache();
+    out_ << "  call " << StripPrefix(call.callee->name) << "\n";
+    if (inst->ty->tag != KOOPA_RTT_UNIT) {
+      EmitStoreValue(inst, "a0");
     }
-    return;
   }
-  if (const auto *unary = dynamic_cast<const UnaryExpr *>(&expr)) {
-    GenerateExpr(*unary->operand, depth);
-    switch (unary->op) {
-      case UnaryOp::Plus:
-        break;
-      case UnaryOp::Minus:
-        out_ << "  sub t0, x0, t0\n";
-        break;
-      case UnaryOp::Not:
-        out_ << "  seqz t0, t0\n";
-        break;
-    }
-    return;
-  }
-  const auto *binary = dynamic_cast<const BinaryExpr *>(&expr);
-  if (binary == nullptr) {
-    throw std::runtime_error("unknown expression node");
-  }
-  if (TryGenerateRewriteLogicExpr(*binary, depth)) {
-    return;
-  }
-  if (binary->op == BinaryOp::And || binary->op == BinaryOp::Or) {
-    const std::string true_label = NewLabel("logic_true");
-    const std::string false_label = NewLabel("logic_false");
-    const std::string end_label = NewLabel("logic_end");
-    GenerateCond(expr, true_label, false_label, depth);
-    out_ << true_label << ":\n";
-    out_ << "  li t0, 1\n";
-    out_ << "  j " << end_label << "\n";
-    out_ << false_label << ":\n";
-    out_ << "  li t0, 0\n";
-    out_ << end_label << ":\n";
-    return;
-  }
-  GenerateExpr(*binary->lhs, depth);
-  EmitStoreStack(out_, "t0", TempOffset(depth));
-  GenerateExpr(*binary->rhs, depth + 1);
-  EmitLoadStack(out_, "t1", TempOffset(depth));
-  switch (binary->op) {
-    case BinaryOp::Add: out_ << "  add t0, t1, t0\n"; break;
-    case BinaryOp::Sub: out_ << "  sub t0, t1, t0\n"; break;
-    case BinaryOp::Mul: out_ << "  mul t0, t1, t0\n"; break;
-    case BinaryOp::Div: out_ << "  div t0, t1, t0\n"; break;
-    case BinaryOp::Mod: out_ << "  rem t0, t1, t0\n"; break;
-    case BinaryOp::Lt: out_ << "  slt t0, t1, t0\n"; break;
-    case BinaryOp::Gt: out_ << "  sgt t0, t1, t0\n"; break;
-    case BinaryOp::Le:
-      out_ << "  sgt t0, t1, t0\n";
-      out_ << "  seqz t0, t0\n";
-      break;
-    case BinaryOp::Ge:
-      out_ << "  slt t0, t1, t0\n";
-      out_ << "  seqz t0, t0\n";
-      break;
-    case BinaryOp::Eq:
-      out_ << "  xor t0, t1, t0\n";
-      out_ << "  seqz t0, t0\n";
-      break;
-    case BinaryOp::Ne:
-      out_ << "  xor t0, t1, t0\n";
-      out_ << "  snez t0, t0\n";
-      break;
-    case BinaryOp::And:
-    case BinaryOp::Or:
-      break;
-  }
-}
 
-void RiscvGenerator::GenerateLValAddress(const LValExpr &lval, int depth) {
-  const Symbol &symbol = LookupSymbol(lval.name);
-  if (symbol.is_pointer) {
-    LoadFromSymbol(symbol, "t0");
-  } else {
-    LoadSymbolAddress(symbol, "t0");
-  }
-  for (size_t i = 0; i < lval.indices.size(); ++i) {
-    EmitStoreStack(out_, "t0", TempOffset(depth));
-    GenerateExpr(*lval.indices[i], depth + 1);
-    out_ << "  mv t1, t0\n";
-    const size_t dim_index = symbol.is_pointer ? i : i + 1;
-    const int stride = TypeSize(symbol.dimensions, dim_index);
-    out_ << "  li t2, " << stride << "\n";
-    out_ << "  mul t1, t1, t2\n";
-    EmitLoadStack(out_, "t0", TempOffset(depth));
-    out_ << "  add t0, t0, t1\n";
-  }
-}
-
-void RiscvGenerator::GenerateCond(const Expr &expr, const std::string &true_label,
-                                  const std::string &false_label, int depth) {
-  if (const auto *binary = dynamic_cast<const BinaryExpr *>(&expr)) {
-    if (binary->op == BinaryOp::And) {
-      const std::string rhs_label = NewLabel("land_rhs");
-      GenerateCond(*binary->lhs, rhs_label, false_label, depth);
-      out_ << rhs_label << ":\n";
-      GenerateCond(*binary->rhs, true_label, false_label, depth);
+  void GenerateGlobal(koopa_raw_value_t value) {
+    if (value->kind.tag != KOOPA_RVT_GLOBAL_ALLOC) {
       return;
     }
-    if (binary->op == BinaryOp::Or) {
-      const std::string rhs_label = NewLabel("lor_rhs");
-      GenerateCond(*binary->lhs, true_label, rhs_label, depth);
-      out_ << rhs_label << ":\n";
-      GenerateCond(*binary->rhs, true_label, false_label, depth);
-      return;
+    out_ << "  .globl " << StripPrefix(value->name) << "\n";
+    out_ << StripPrefix(value->name) << ":\n";
+    GenerateGlobalInit(value->kind.data.global_alloc.init, PointeeSize(value));
+  }
+
+  void GenerateGlobalInit(koopa_raw_value_t init, int bytes) {
+    switch (init->kind.tag) {
+      case KOOPA_RVT_INTEGER:
+        out_ << "  .word " << init->kind.data.integer.value << "\n";
+        break;
+      case KOOPA_RVT_ZERO_INIT:
+      case KOOPA_RVT_UNDEF:
+        out_ << "  .zero " << bytes << "\n";
+        break;
+      case KOOPA_RVT_AGGREGATE:
+        for (uint32_t i = 0; i < init->kind.data.aggregate.elems.len; ++i) {
+          const auto elem = reinterpret_cast<koopa_raw_value_t>(init->kind.data.aggregate.elems.buffer[i]);
+          GenerateGlobalInit(elem, TypeSize(elem->ty));
+        }
+        break;
+      default:
+        throw std::runtime_error("unsupported global initializer");
     }
   }
-  GenerateExpr(expr, depth);
-  FlushAndClearRegCache();
-  out_ << "  bnez t0, " << true_label << "\n";
-  out_ << "  j " << false_label << "\n";
-}
 
-std::vector<int> RiscvGenerator::EvalDimensions(
-    const std::vector<std::unique_ptr<Expr>> &dimensions) const {
-  std::vector<int> result;
-  for (const auto &dimension : dimensions) {
-    result.push_back(EvalConstExpr(*dimension));
-  }
-  return result;
-}
+  static int AlignTo16(int bytes) { return (bytes + 15) / 16 * 16; }
 
-void RiscvGenerator::GenerateLocalArrayInit(const Symbol &symbol, const InitVal &init, int depth) {
-  const std::vector<const Expr *> exprs = FlattenInitExprs(init, symbol.dimensions);
-  for (size_t i = 0; i < exprs.size(); ++i) {
-    Symbol elem = symbol;
-    elem.dimensions.clear();
-    elem.stack_offset = symbol.stack_offset + static_cast<int>(i) * 4;
-    if (exprs[i] != nullptr) {
-      GenerateExpr(*exprs[i], depth);
-    } else {
-      out_ << "  li t0, 0\n";
+  std::ostream &out_;
+  std::unordered_map<koopa_raw_value_t, int> value_offsets_;
+  std::unordered_map<koopa_raw_value_t, int> remaining_uses_;
+  std::unordered_map<koopa_raw_value_t, std::string> allocated_regs_;
+  std::unordered_map<koopa_raw_value_t, std::string> value_regs_;
+  std::unordered_map<koopa_raw_value_t, koopa_raw_basic_block_t> value_blocks_;
+  std::unordered_set<koopa_raw_value_t> reg_only_values_;
+  std::unordered_set<koopa_raw_value_t> live_values_;
+  std::unordered_set<koopa_raw_value_t> promotable_allocs_;
+  std::unordered_set<koopa_raw_value_t> local_promotable_allocs_;
+  std::unordered_map<koopa_raw_value_t, koopa_raw_value_t> alloc_current_values_;
+  std::string current_function_;
+  int local_bytes_ = 0;
+  int out_arg_bytes_ = 0;
+  int frame_size_ = 0;
+  bool needs_ra_ = false;
+};
+
+class KoopaProgramHandle {
+ public:
+  explicit KoopaProgramHandle(const std::string &text) {
+    if (koopa_parse_from_string(text.c_str(), &program_) != KOOPA_EC_SUCCESS) {
+      throw std::runtime_error("failed to parse generated Koopa IR");
     }
-    StoreToSymbol(elem, "t0");
+    builder_ = koopa_new_raw_program_builder();
+    raw_ = koopa_build_raw_program(builder_, program_);
   }
-}
 
-int RiscvGenerator::EvalConstExpr(const Expr &expr) const {
-  if (const auto *number = dynamic_cast<const NumberExpr *>(&expr)) {
-    return number->value;
-  }
-  if (const auto *lval = dynamic_cast<const LValExpr *>(&expr)) {
-    const Symbol &symbol = LookupSymbol(lval->name);
-    if (symbol.kind != Symbol::Kind::Const || !symbol.dimensions.empty() || !lval->indices.empty()) {
-      throw std::runtime_error("variable is not allowed in constant expression: " + lval->name);
+  ~KoopaProgramHandle() {
+    if (builder_ != nullptr) {
+      koopa_delete_raw_program_builder(builder_);
     }
-    return symbol.const_value;
-  }
-  if (const auto *unary = dynamic_cast<const UnaryExpr *>(&expr)) {
-    const int value = EvalConstExpr(*unary->operand);
-    switch (unary->op) {
-      case UnaryOp::Plus: return value;
-      case UnaryOp::Minus: return -value;
-      case UnaryOp::Not: return value == 0;
+    if (program_ != nullptr) {
+      koopa_delete_program(program_);
     }
   }
-  const auto *binary = dynamic_cast<const BinaryExpr *>(&expr);
-  if (binary == nullptr) {
-    throw std::runtime_error("unknown expression node");
+
+  const koopa_raw_program_t &raw() const { return raw_; }
+
+ private:
+  koopa_program_t program_ = nullptr;
+  koopa_raw_program_builder_t builder_ = nullptr;
+  koopa_raw_program_t raw_{};
+};
+
+void WriteRiscvFromKoopaText(const std::string &path, const std::string &koopa_text) {
+  KoopaProgramHandle program(koopa_text);
+  std::ostringstream buffer;
+  KoopaRawRiscvGenerator generator(buffer);
+  generator.Generate(program.raw());
+
+  std::ofstream out(path);
+  if (!out) {
+    throw std::runtime_error("failed to open output file: " + path);
   }
-  if (binary->op == BinaryOp::And) {
-    return (EvalConstExpr(*binary->lhs) != 0) && (EvalConstExpr(*binary->rhs) != 0);
-  }
-  if (binary->op == BinaryOp::Or) {
-    return (EvalConstExpr(*binary->lhs) != 0) || (EvalConstExpr(*binary->rhs) != 0);
-  }
-  const int lhs = EvalConstExpr(*binary->lhs);
-  const int rhs = EvalConstExpr(*binary->rhs);
-  switch (binary->op) {
-    case BinaryOp::Add: return lhs + rhs;
-    case BinaryOp::Sub: return lhs - rhs;
-    case BinaryOp::Mul: return lhs * rhs;
-    case BinaryOp::Div: return lhs / rhs;
-    case BinaryOp::Mod: return lhs % rhs;
-    case BinaryOp::Lt: return lhs < rhs;
-    case BinaryOp::Gt: return lhs > rhs;
-    case BinaryOp::Le: return lhs <= rhs;
-    case BinaryOp::Ge: return lhs >= rhs;
-    case BinaryOp::Eq: return lhs == rhs;
-    case BinaryOp::Ne: return lhs != rhs;
-    case BinaryOp::And:
-    case BinaryOp::Or:
-      break;
-  }
-  throw std::runtime_error("unknown binary operator");
+  out << OptimizeAsm(buffer.str());
 }
 
-void RiscvGenerator::PushScope() { scopes_.emplace_back(); }
-void RiscvGenerator::PopScope() { scopes_.pop_back(); }
-
-void RiscvGenerator::InsertSymbol(const std::string &name, Symbol symbol) {
-  if (scopes_.empty()) {
-    throw std::runtime_error("internal error: no active scope");
-  }
-  if (!scopes_.back().emplace(name, std::move(symbol)).second) {
-    throw std::runtime_error("redefined symbol: " + name);
-  }
-}
-
-Symbol &RiscvGenerator::LookupSymbol(const std::string &name) {
-  for (auto it = scopes_.rbegin(); it != scopes_.rend(); ++it) {
-    auto found = it->find(name);
-    if (found != it->end()) {
-      return found->second;
-    }
-  }
-  throw std::runtime_error("undefined symbol: " + name);
-}
-
-const Symbol &RiscvGenerator::LookupSymbol(const std::string &name) const {
-  for (auto it = scopes_.rbegin(); it != scopes_.rend(); ++it) {
-    auto found = it->find(name);
-    if (found != it->end()) {
-      return found->second;
-    }
-  }
-  throw std::runtime_error("undefined symbol: " + name);
-}
-
-int RiscvGenerator::TempOffset(int depth) const {
-  return out_arg_bytes_ + local_bytes_ + depth * 4;
-}
-
-void RiscvGenerator::EmitStackAdjust(int bytes) {
-  if (bytes == 0) {
-    return;
-  }
-  if (Fits12Bit(bytes)) {
-    out_ << "  addi sp, sp, " << bytes << "\n";
-    return;
-  }
-  out_ << "  li t0, " << bytes << "\n";
-  out_ << "  add sp, sp, t0\n";
-}
-
-void RiscvGenerator::EmitReturn() {
-  if (needs_ra_) {
-    EmitLoadStack(out_, "ra", frame_size_ - 4);
-  }
-  EmitStackAdjust(frame_size_);
-  out_ << "  ret\n";
-}
-
-void RiscvGenerator::StoreToSymbol(const Symbol &symbol, const std::string &reg) {
-  if (CanCacheSymbol(symbol)) {
-    CachedReg &cached = EnsureCachedReg(symbol);
-    if (cached.reg != reg) {
-      out_ << "  mv " << cached.reg << ", " << reg << "\n";
-    }
-    cached.dirty = true;
-    return;
-  }
-  if (symbol.kind == Symbol::Kind::GlobalVar || (!symbol.asm_name.empty())) {
-    out_ << "  la t1, " << symbol.asm_name << "\n";
-    out_ << "  sw " << reg << ", 0(t1)\n";
-  } else {
-    EmitStoreStack(out_, reg, symbol.stack_offset);
-  }
-}
-
-void RiscvGenerator::LoadFromSymbol(const Symbol &symbol, const std::string &reg) {
-  if (CanCacheSymbol(symbol)) {
-    if (CachedReg *cached = FindCachedReg(symbol)) {
-      if (cached->reg != reg) {
-        out_ << "  mv " << reg << ", " << cached->reg << "\n";
-      }
-      return;
-    }
-    CachedReg &cached = EnsureCachedReg(symbol);
-    EmitLoadStack(out_, cached.reg, symbol.stack_offset);
-    if (cached.reg != reg) {
-      out_ << "  mv " << reg << ", " << cached.reg << "\n";
-    }
-    return;
-  }
-  if (symbol.kind == Symbol::Kind::GlobalVar || (!symbol.asm_name.empty())) {
-    out_ << "  la " << reg << ", " << symbol.asm_name << "\n";
-    out_ << "  lw " << reg << ", 0(" << reg << ")\n";
-  } else {
-    EmitLoadStack(out_, reg, symbol.stack_offset);
-  }
-}
-
-bool RiscvGenerator::CanCacheSymbol(const Symbol &symbol) const {
-  return symbol.cacheable && symbol.kind == Symbol::Kind::Var &&
-         symbol.asm_name.empty() && symbol.dimensions.empty() && !symbol.is_pointer;
-}
-
-CachedReg *RiscvGenerator::FindCachedReg(const Symbol &symbol) {
-  for (CachedReg &cached : reg_cache_) {
-    if (cached.stack_offset == symbol.stack_offset) {
-      return &cached;
-    }
-  }
-  return nullptr;
-}
-
-CachedReg &RiscvGenerator::EnsureCachedReg(const Symbol &symbol) {
-  if (CachedReg *cached = FindCachedReg(symbol)) {
-    return *cached;
-  }
-
-  static const char *kCacheRegs[] = {"t3", "t4", "t5", "t6"};
-  constexpr size_t kCacheRegCount = sizeof(kCacheRegs) / sizeof(kCacheRegs[0]);
-  if (reg_cache_.size() < kCacheRegCount) {
-    reg_cache_.push_back(CachedReg{symbol.stack_offset, kCacheRegs[reg_cache_.size()], false});
-    return reg_cache_.back();
-  }
-
-  CachedReg &victim = reg_cache_.front();
-  if (victim.dirty) {
-    EmitStoreStack(out_, victim.reg, victim.stack_offset);
-  }
-  victim.stack_offset = symbol.stack_offset;
-  victim.dirty = false;
-  return victim;
-}
-
-void RiscvGenerator::FlushRegCache() {
-  for (CachedReg &cached : reg_cache_) {
-    if (cached.dirty) {
-      EmitStoreStack(out_, cached.reg, cached.stack_offset);
-      cached.dirty = false;
-    }
-  }
-}
-
-void RiscvGenerator::ClearRegCache() { reg_cache_.clear(); }
-
-void RiscvGenerator::FlushAndClearRegCache() {
-  FlushRegCache();
-  ClearRegCache();
-}
-
-void RiscvGenerator::StoreAddressed(const std::string &addr_reg, const std::string &value_reg) {
-  out_ << "  sw " << value_reg << ", 0(" << addr_reg << ")\n";
-}
-
-void RiscvGenerator::LoadAddressed(const std::string &addr_reg, const std::string &value_reg) {
-  out_ << "  lw " << value_reg << ", 0(" << addr_reg << ")\n";
-}
-
-void RiscvGenerator::LoadSymbolAddress(const Symbol &symbol, const std::string &reg) {
-  if (symbol.kind == Symbol::Kind::GlobalVar || (symbol.kind == Symbol::Kind::Const && !symbol.asm_name.empty())) {
-    out_ << "  la " << reg << ", " << symbol.asm_name << "\n";
-  } else {
-    if (Fits12Bit(symbol.stack_offset)) {
-      out_ << "  addi " << reg << ", sp, " << symbol.stack_offset << "\n";
-    } else {
-      out_ << "  li " << reg << ", " << symbol.stack_offset << "\n";
-      out_ << "  add " << reg << ", sp, " << reg << "\n";
-    }
-  }
-}
-
-std::string RiscvGenerator::NewLabel(const std::string &hint) {
-  return ".L" + hint + "_" + std::to_string(next_label_id_++);
-}
-
-int RiscvGenerator::AlignTo16(int bytes) { return (bytes + 15) / 16 * 16; }
 
 void WriteKoopa(const std::string &path, const Program &program) {
   std::ofstream out(path);
@@ -2216,30 +2115,20 @@ void WriteKoopaRewrite(const std::string &path, const Program &program,
 }
 
 void WriteRiscv(const std::string &path, const Program &program) {
-  std::ostringstream buffer;
-  RiscvGenerator generator(buffer);
+  std::ostringstream koopa;
+  KoopaGenerator generator(koopa);
   generator.Generate(program);
-
-  std::ofstream out(path);
-  if (!out) {
-    throw std::runtime_error("failed to open output file: " + path);
-  }
-  out << OptimizeAsm(buffer.str());
+  WriteRiscvFromKoopaText(path, koopa.str());
 }
 
 void WriteRiscvRewrite(const std::string &path, const Program &program,
                        std::unordered_set<std::string> rewrite_if_locs,
                        std::unordered_set<std::string> rewrite_array_lookup_locs,
                        std::unordered_set<std::string> rewrite_logic_expr_locs) {
-  std::ostringstream buffer;
-  RiscvGenerator generator(buffer, std::move(rewrite_if_locs),
+  std::ostringstream koopa;
+  KoopaGenerator generator(koopa, std::move(rewrite_if_locs),
                            std::move(rewrite_array_lookup_locs),
                            std::move(rewrite_logic_expr_locs));
   generator.Generate(program);
-
-  std::ofstream out(path);
-  if (!out) {
-    throw std::runtime_error("failed to open output file: " + path);
-  }
-  out << OptimizeAsm(buffer.str());
+  WriteRiscvFromKoopaText(path, koopa.str());
 }
