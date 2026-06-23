@@ -9,7 +9,7 @@
 #include <stdexcept>
 #include <utility>
 
-#include "koopa.h"
+#include <koopa.h>
 
 namespace {
 
