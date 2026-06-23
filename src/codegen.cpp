@@ -1739,6 +1739,15 @@ class KoopaRawRiscvGenerator {
     }
   }
 
+  void EmitJump(const std::string &label) {
+    if (!use_far_jumps_) {
+      out_ << "  j " << label << "\n";
+      return;
+    }
+    out_ << "  la t2, " << label << "\n";
+    out_ << "  jr t2\n";
+  }
+
   void EmitReturn() {
     if (needs_ra_) {
       EmitLoadStack(out_, "ra", frame_size_ - 4);
@@ -1756,6 +1765,7 @@ class KoopaRawRiscvGenerator {
     out_arg_bytes_ = 0;
     needs_ra_ = false;
     frame_size_ = 0;
+    int inst_count = 0;
 
     for (uint32_t i = 0; i < func->params.len; ++i) {
       AssignSlot(reinterpret_cast<koopa_raw_value_t>(func->params.buffer[i]), 4);
@@ -1768,6 +1778,7 @@ class KoopaRawRiscvGenerator {
         if (IsDeadPureInst(inst)) {
           continue;
         }
+        ++inst_count;
         if (inst->kind.tag == KOOPA_RVT_ALLOC) {
           AssignSlot(inst, PointeeSize(inst));
           if (IsPromotableScalarAlloc(inst)) {
@@ -1786,6 +1797,7 @@ class KoopaRawRiscvGenerator {
       }
     }
     frame_size_ = AlignTo16(out_arg_bytes_ + local_bytes_ + (needs_ra_ ? 4 : 0));
+    use_far_jumps_ = inst_count > 16000;
   }
 
   void GenerateFunction(koopa_raw_function_t func) {
@@ -1845,7 +1857,7 @@ class KoopaRawRiscvGenerator {
         GenerateBranch(inst);
         break;
       case KOOPA_RVT_JUMP:
-        out_ << "  j " << LabelName(inst->kind.data.jump.target) << "\n";
+        EmitJump(LabelName(inst->kind.data.jump.target));
         break;
       case KOOPA_RVT_CALL:
         GenerateCall(inst);
@@ -1978,9 +1990,14 @@ class KoopaRawRiscvGenerator {
 
   void GenerateBranch(koopa_raw_value_t inst) {
     const auto &branch = inst->kind.data.branch;
+    const std::string false_jump_label = ".L" + current_function_ +
+                                         "_branch_false_" +
+                                         std::to_string(next_branch_label_id_++);
     EmitLoadValue(branch.cond, "t0");
-    out_ << "  bnez t0, " << LabelName(branch.true_bb) << "\n";
-    out_ << "  j " << LabelName(branch.false_bb) << "\n";
+    out_ << "  beqz t0, " << false_jump_label << "\n";
+    EmitJump(LabelName(branch.true_bb));
+    out_ << false_jump_label << ":\n";
+    EmitJump(LabelName(branch.false_bb));
   }
 
   void GenerateCall(koopa_raw_value_t inst) {
@@ -2047,7 +2064,9 @@ class KoopaRawRiscvGenerator {
   int local_bytes_ = 0;
   int out_arg_bytes_ = 0;
   int frame_size_ = 0;
+  int next_branch_label_id_ = 0;
   bool needs_ra_ = false;
+  bool use_far_jumps_ = false;
 };
 
 class KoopaProgramHandle {
