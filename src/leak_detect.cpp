@@ -4,6 +4,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -27,9 +28,17 @@ struct ExprTaint {
   std::string subject;
 };
 
+struct ArrayTaint {
+  bool whole_array_secret = false;
+  TaintInfo whole_array_reason;
+  std::unordered_map<int, TaintInfo> element_taint;
+};
+
 struct LeakSymbol {
   TaintInfo taint;
   bool is_array = false;
+  std::string alias_to;
+  ArrayTaint array_taint;
 };
 
 struct FuncInfo {
@@ -44,6 +53,28 @@ struct FunctionSummary {
   std::vector<bool> return_depends_on_param;
   bool conservative = false;
 };
+
+std::string LValSubjectWithBase(const LValExpr &lval, const std::string &base) {
+  std::string subject = base;
+  for (const auto &index : lval.indices) {
+    if (const auto *number = dynamic_cast<const NumberExpr *>(index.get())) {
+      subject += "[" + std::to_string(number->value) + "]";
+    } else {
+      subject += "[?]";
+    }
+  }
+  return subject;
+}
+
+std::optional<int> ConstIndex(const LValExpr &lval) {
+  if (lval.indices.size() != 1) {
+    return std::nullopt;
+  }
+  if (const auto *number = dynamic_cast<const NumberExpr *>(lval.indices[0].get())) {
+    return number->value;
+  }
+  return std::nullopt;
+}
 
 struct AnalysisOptions {
   bool collect_reports = true;
@@ -73,6 +104,13 @@ TaintInfo SecretTaint(std::string reason, SourceLocation loc, std::string subjec
   taint.loc = loc;
   taint.subject = std::move(subject);
   return taint;
+}
+
+LeakSymbol MakeSymbol(TaintInfo taint, bool is_array) {
+  LeakSymbol symbol;
+  symbol.taint = std::move(taint);
+  symbol.is_array = is_array;
+  return symbol;
 }
 
 TaintInfo Join(TaintInfo lhs, const TaintInfo &rhs) {
@@ -244,9 +282,9 @@ class LeakDetector {
     PushScope();
     for (size_t i = 0; i < function.params.size(); ++i) {
       const Param &param = function.params[i];
-      InsertSymbol(param.name, LeakSymbol{InitialTaint(param.name, param.loc), param.is_array});
+      InsertSymbol(param.name, MakeSymbol(InitialTaint(param.name, param.loc), param.is_array));
       if (static_cast<int>(i) == secret_param) {
-        SetSymbolTaint(param.name, SecretTaint(param.name + " is secret because it is the selected summary parameter at " + LocString(param.loc), param.loc, param.name));
+        AssignSymbolTaint(param.name, SecretTaint(param.name + " is secret because it is the selected summary parameter at " + LocString(param.loc), param.loc, param.name));
       }
       for (const auto &dimension : param.dimensions) {
         AnalyzeExpr(*dimension);
@@ -292,28 +330,89 @@ class LeakDetector {
     }
   }
 
-  LeakSymbol LookupSymbol(const std::string &name) const {
+  LeakSymbol *FindSymbol(const std::string &name) {
     for (auto it = scopes_.rbegin(); it != scopes_.rend(); ++it) {
       const auto found = it->find(name);
       if (found != it->end()) {
-        return found->second;
+        return &found->second;
       }
     }
-    return LeakSymbol{InitialTaint(name, SourceLocation{}), false};
+    return nullptr;
   }
 
-  void SetSymbolTaint(const std::string &name, TaintInfo taint) {
-    if (IsSecretName(name)) {
-      taint = Join(InitialTaint(name, taint.loc), taint);
-    }
+  const LeakSymbol *FindSymbol(const std::string &name) const {
     for (auto it = scopes_.rbegin(); it != scopes_.rend(); ++it) {
       const auto found = it->find(name);
       if (found != it->end()) {
-        found->second.taint = Join(found->second.taint, taint);
-        return;
+        return &found->second;
       }
     }
-    InsertSymbol(name, LeakSymbol{std::move(taint), false});
+    return nullptr;
+  }
+
+  std::string ResolveAlias(const std::string &name) const {
+    const LeakSymbol *symbol = FindSymbol(name);
+    if (symbol != nullptr && !symbol->alias_to.empty()) {
+      return symbol->alias_to;
+    }
+    return name;
+  }
+
+  std::string ResolvedLValSubject(const LValExpr &lval) const {
+    return LValSubjectWithBase(lval, ResolveAlias(lval.name));
+  }
+
+  LeakSymbol LookupSymbol(const std::string &name) const {
+    const std::string resolved = ResolveAlias(name);
+    if (const LeakSymbol *symbol = FindSymbol(resolved)) {
+      return *symbol;
+    }
+    return MakeSymbol(InitialTaint(resolved, SourceLocation{}), false);
+  }
+
+  void AssignSymbolTaint(const std::string &name, TaintInfo taint) {
+    const std::string resolved = ResolveAlias(name);
+    if (IsSecretName(resolved)) {
+      taint = Join(InitialTaint(resolved, taint.loc), taint);
+    }
+    if (LeakSymbol *symbol = FindSymbol(resolved)) {
+      symbol->taint = std::move(taint);
+      if (!IsSecret(symbol->taint.level)) {
+        symbol->array_taint.whole_array_secret = false;
+        symbol->array_taint.element_taint.clear();
+      }
+      return;
+    }
+    InsertSymbol(resolved, MakeSymbol(std::move(taint), false));
+  }
+
+  void SetArrayElementTaint(const std::string &name, int index, TaintInfo taint) {
+    const std::string resolved = ResolveAlias(name);
+    LeakSymbol *symbol = FindSymbol(resolved);
+    if (symbol == nullptr) {
+      InsertSymbol(resolved, MakeSymbol(PublicTaint(taint.loc, resolved), true));
+      symbol = FindSymbol(resolved);
+    }
+    symbol->is_array = true;
+    if (IsSecret(taint.level)) {
+      symbol->array_taint.element_taint[index] = std::move(taint);
+    } else {
+      symbol->array_taint.element_taint.erase(index);
+    }
+  }
+
+  void SetArrayWholeTaint(const std::string &name, TaintInfo taint) {
+    const std::string resolved = ResolveAlias(name);
+    LeakSymbol *symbol = FindSymbol(resolved);
+    if (symbol == nullptr) {
+      InsertSymbol(resolved, MakeSymbol(PublicTaint(taint.loc, resolved), true));
+      symbol = FindSymbol(resolved);
+    }
+    symbol->is_array = true;
+    if (IsSecret(taint.level)) {
+      symbol->array_taint.whole_array_secret = true;
+      symbol->array_taint.whole_array_reason = std::move(taint);
+    }
   }
 
   void Report(LeakKind kind, Severity severity, SourceLocation loc,
@@ -343,7 +442,7 @@ class LeakDetector {
       if (param_override != nullptr && i < param_override->size()) {
         taint = Join(taint, (*param_override)[i]);
       }
-      InsertSymbol(param.name, LeakSymbol{taint, param.is_array});
+      InsertSymbol(param.name, MakeSymbol(taint, param.is_array));
       for (const auto &dimension : param.dimensions) {
         AnalyzeExpr(*dimension);
       }
@@ -444,7 +543,10 @@ class LeakDetector {
       TaintInfo taint = InitialTaint(def.name, def.loc);
       taint = Join(taint, AnalyzeInit(def.init));
       taint = Join(taint, control_taint_);
-      InsertSymbol(def.name, LeakSymbol{taint, !def.dimensions.empty()});
+      InsertSymbol(def.name, MakeSymbol(taint, !def.dimensions.empty()));
+      if (!def.dimensions.empty() && IsSecret(taint.level)) {
+        SetArrayWholeTaint(def.name, taint);
+      }
     }
   }
 
@@ -466,7 +568,10 @@ class LeakDetector {
       if (IsSecret(control_taint_.level) && !IsSecret(taint.level)) {
         taint = SecretTaint(def.name + " is secret because it was assigned under secret control at " + LocString(def.loc), def.loc, def.name);
       }
-      InsertSymbol(def.name, LeakSymbol{taint, !def.dimensions.empty()});
+      InsertSymbol(def.name, MakeSymbol(taint, !def.dimensions.empty()));
+      if (!def.dimensions.empty() && IsSecret(taint.level)) {
+        SetArrayWholeTaint(def.name, taint);
+      }
     }
   }
 
@@ -486,22 +591,47 @@ class LeakDetector {
     const ExprTaint index_taint = AnalyzeLValIndices(lval);
     if (IsSecret(index_taint.level)) {
       Report(LeakKind::SecretArrayIndex, Severity::High, lval.loc, lval.name,
-             "write to " + lval.name + " uses a secret index", index_taint.reason);
+             "write to " + ResolvedLValSubject(lval) + " uses a secret index", index_taint.reason);
     }
+
     TaintInfo assigned = Join(ToTaint(rhs_taint), control_taint_);
     if (lval.indices.empty()) {
       if (IsSecret(control_taint_.level)) {
         assigned = SecretTaint(lval.name + " is secret because it was assigned under secret control at " + LocString(loc), loc, lval.name);
       } else if (IsSecret(rhs_taint.level)) {
         assigned.reason = lval.name + " is secret because it was assigned from " + rhs_taint.subject + " at " + LocString(loc);
+        if (!rhs_taint.reason.empty()) {
+          assigned.reason += "; " + rhs_taint.reason;
+        }
         assigned.subject = lval.name;
         assigned.loc = loc;
       }
-      SetSymbolTaint(lval.name, assigned);
+      AssignSymbolTaint(lval.name, assigned);
       return;
     }
+
+    const std::string subject = ResolvedLValSubject(lval);
+    const std::optional<int> index = ConstIndex(lval);
     if (IsSecret(assigned.level)) {
-      SetSymbolTaint(lval.name, SecretTaint(lval.name + " is secret because a secret value was written into one of its elements at " + LocString(loc), loc, lval.name));
+      TaintInfo element_taint = assigned;
+      element_taint.reason = subject + " is secret because it was assigned from " +
+                             (rhs_taint.subject.empty() ? assigned.subject : rhs_taint.subject) +
+                             " at " + LocString(loc);
+      if (!rhs_taint.reason.empty()) {
+        element_taint.reason += "; " + rhs_taint.reason;
+      }
+      if (IsSecret(control_taint_.level) && !IsSecret(rhs_taint.level)) {
+        element_taint.reason = subject + " is secret because it was assigned under secret control at " + LocString(loc);
+      }
+      element_taint.subject = subject;
+      element_taint.loc = loc;
+      if (index.has_value()) {
+        SetArrayElementTaint(lval.name, *index, element_taint);
+      } else {
+        SetArrayWholeTaint(lval.name, element_taint);
+      }
+    } else if (index.has_value()) {
+      SetArrayElementTaint(lval.name, *index, PublicTaint(loc, subject));
     }
   }
 
@@ -515,9 +645,9 @@ class LeakDetector {
       const ExprTaint index_taint = AnalyzeLValIndices(*lval);
       if (IsSecret(index_taint.level)) {
         Report(LeakKind::SecretArrayIndex, Severity::High, lval->loc, lval->name,
-               "read from " + lval->name + " uses a secret index", index_taint.reason);
+               "read from " + ResolvedLValSubject(*lval) + " uses a secret index", index_taint.reason);
       }
-      return ToExpr(LookupSymbol(lval->name).taint);
+      return AnalyzeLValRead(*lval);
     }
 
     if (const auto *call = dynamic_cast<const CallExpr *>(&expr)) {
@@ -568,7 +698,7 @@ class LeakDetector {
     if (IsOutputFunction(call.name)) {
       if (has_secret_arg) {
         Report(LeakKind::SecretObservableCall, Severity::High, call.loc, call.name,
-               call.name + " observes secret data", secret_arg.reason);
+               call.name + " observes " + secret_arg.subject, secret_arg.reason);
       }
       if (IsSecret(control_taint_.level)) {
         Report(LeakKind::SecretObservableCall, Severity::Medium, call.loc, call.name,
@@ -636,10 +766,19 @@ class LeakDetector {
     for (size_t i = 0; i < function.params.size(); ++i) {
       const Param &param = function.params[i];
       TaintInfo taint = InitialTaint(param.name, param.loc);
+      LeakSymbol symbol = MakeSymbol(taint, param.is_array);
       if (i < arg_taints.size()) {
         taint = Join(taint, ToTaint(arg_taints[i]));
+        symbol.taint = taint;
+        if (param.is_array) {
+          if (const auto *actual = dynamic_cast<const LValExpr *>(call.args[i].get())) {
+            if (actual->indices.empty()) {
+              symbol.alias_to = ResolveAlias(actual->name);
+            }
+          }
+        }
       }
-      InsertSymbol(param.name, LeakSymbol{taint, param.is_array});
+      InsertSymbol(param.name, std::move(symbol));
       for (const auto &dimension : param.dimensions) {
         AnalyzeExpr(*dimension);
       }
@@ -669,6 +808,39 @@ class LeakDetector {
       return nullptr;
     }
     return &EnsureSummary(name);
+  }
+
+  ExprTaint AnalyzeLValRead(const LValExpr &lval) {
+    const LeakSymbol symbol = LookupSymbol(lval.name);
+    if (lval.indices.empty()) {
+      TaintInfo taint = symbol.taint;
+      taint.subject = lval.name;
+      taint.loc = lval.loc;
+      return ToExpr(taint);
+    }
+
+    const std::string subject = ResolvedLValSubject(lval);
+    if (symbol.array_taint.whole_array_secret) {
+      TaintInfo taint = symbol.array_taint.whole_array_reason;
+      taint.subject = subject;
+      taint.loc = lval.loc;
+      return ToExpr(taint);
+    }
+    const std::optional<int> index = ConstIndex(lval);
+    if (index.has_value()) {
+      const auto found = symbol.array_taint.element_taint.find(*index);
+      if (found != symbol.array_taint.element_taint.end()) {
+        TaintInfo taint = found->second;
+        taint.subject = subject;
+        taint.loc = lval.loc;
+        return ToExpr(taint);
+      }
+      return ExprTaint{SecLevel::Public, "", lval.loc, subject};
+    }
+    TaintInfo taint = symbol.taint;
+    taint.subject = subject;
+    taint.loc = lval.loc;
+    return ToExpr(taint);
   }
 
   ExprTaint AnalyzeLValIndices(const LValExpr &lval) {
