@@ -44,7 +44,9 @@ struct KoopaAddrInfo {
 class KoopaGenerator {
  public:
   explicit KoopaGenerator(std::ostream &out);
-  KoopaGenerator(std::ostream &out, std::unordered_set<std::string> rewrite_if_locs);
+  KoopaGenerator(std::ostream &out, std::unordered_set<std::string> rewrite_if_locs,
+                 std::unordered_set<std::string> rewrite_array_lookup_locs,
+                 std::unordered_set<std::string> rewrite_logic_expr_locs);
 
   void Generate(const Program &program);
 
@@ -62,6 +64,8 @@ class KoopaGenerator {
   void GenerateItem(const BlockItem &item);
   void GenerateIf(const BlockItem &item);
   bool TryGenerateRewriteIf(const BlockItem &item);
+  std::string TryGenerateRewriteArrayLookup(const LValExpr &lval);
+  std::string TryGenerateRewriteLogicExpr(const BinaryExpr &expr);
   void GenerateWhile(const BlockItem &item);
   std::string GenerateExpr(const Expr &expr);
   KoopaAddrInfo GenerateLValAddress(const LValExpr &lval);
@@ -97,11 +101,16 @@ class KoopaGenerator {
   std::vector<std::string> loop_entry_labels_;
   std::vector<std::string> loop_end_labels_;
   std::unordered_set<std::string> rewrite_if_locs_;
+  std::unordered_set<std::string> rewrite_array_lookup_locs_;
+  std::unordered_set<std::string> rewrite_logic_expr_locs_;
 };
 
 class RiscvGenerator {
  public:
   explicit RiscvGenerator(std::ostream &out);
+  RiscvGenerator(std::ostream &out, std::unordered_set<std::string> rewrite_if_locs,
+                 std::unordered_set<std::string> rewrite_array_lookup_locs,
+                 std::unordered_set<std::string> rewrite_logic_expr_locs);
 
   void Generate(const Program &program);
 
@@ -118,6 +127,9 @@ class RiscvGenerator {
   void GenerateBlock(const Block &block);
   void GenerateItem(const BlockItem &item);
   void GenerateIf(const BlockItem &item);
+  bool TryGenerateRewriteIf(const BlockItem &item);
+  bool TryGenerateRewriteArrayLookup(const LValExpr &lval, int depth);
+  bool TryGenerateRewriteLogicExpr(const BinaryExpr &expr, int depth);
   void GenerateWhile(const BlockItem &item);
   std::string CurrentLoopEntry() const;
   std::string CurrentLoopEnd() const;
@@ -165,9 +177,18 @@ class RiscvGenerator {
   std::vector<std::string> loop_entry_labels_;
   std::vector<std::string> loop_end_labels_;
   std::vector<CachedReg> reg_cache_;
+  std::unordered_set<std::string> rewrite_if_locs_;
+  std::unordered_set<std::string> rewrite_array_lookup_locs_;
+  std::unordered_set<std::string> rewrite_logic_expr_locs_;
 };
 
 void WriteKoopa(const std::string &path, const Program &program);
 void WriteKoopaRewrite(const std::string &path, const Program &program,
-                       std::unordered_set<std::string> rewrite_if_locs);
+                       std::unordered_set<std::string> rewrite_if_locs,
+                       std::unordered_set<std::string> rewrite_array_lookup_locs,
+                       std::unordered_set<std::string> rewrite_logic_expr_locs);
 void WriteRiscv(const std::string &path, const Program &program);
+void WriteRiscvRewrite(const std::string &path, const Program &program,
+                       std::unordered_set<std::string> rewrite_if_locs,
+                       std::unordered_set<std::string> rewrite_array_lookup_locs,
+                       std::unordered_set<std::string> rewrite_logic_expr_locs);

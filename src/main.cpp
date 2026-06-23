@@ -23,7 +23,7 @@ Options ParseArgs(int argc, char **argv) {
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "-koopa" || arg == "-riscv" || arg == "-perf" ||
-        arg == "-detect" || arg == "-rewrite-koopa") {
+        arg == "-detect" || arg == "-rewrite-koopa" || arg == "-rewrite-riscv") {
       if (++i >= argc) {
         throw std::runtime_error("missing input after " + arg);
       }
@@ -41,10 +41,10 @@ Options ParseArgs(int argc, char **argv) {
 
   if ((options.mode != "-koopa" && options.mode != "-riscv" &&
        options.mode != "-perf" && options.mode != "-detect" &&
-       options.mode != "-rewrite-koopa") ||
+       options.mode != "-rewrite-koopa" && options.mode != "-rewrite-riscv") ||
       options.input.empty() || options.output.empty()) {
     throw std::runtime_error(
-        "usage: compiler <-koopa|-riscv|-perf|-detect|-rewrite-koopa> <input> -o <output>");
+        "usage: compiler <-koopa|-riscv|-perf|-detect|-rewrite-koopa|-rewrite-riscv> <input> -o <output>");
   }
   return options;
 }
@@ -101,7 +101,7 @@ int main(int argc, char **argv) {
       }
       return 0;
     }
-    if (options.mode == "-rewrite-koopa") {
+    if (options.mode == "-rewrite-koopa" || options.mode == "-rewrite-riscv") {
       const std::vector<LeakReport> leaks = DetectSideChannelLeaks(*program);
       RewritePlan plan = BuildRewritePlan(*program, leaks);
       if (!plan.AllSupported()) {
@@ -115,7 +115,17 @@ int main(int argc, char **argv) {
         return 1;
       }
       OptimizeAst(*program);
-      WriteKoopaRewrite(options.output, *program, std::move(plan.conditional_assign_locs));
+      if (options.mode == "-rewrite-koopa") {
+        WriteKoopaRewrite(options.output, *program,
+                          std::move(plan.conditional_assign_locs),
+                          std::move(plan.array_lookup_locs),
+                          std::move(plan.logic_expr_locs));
+      } else {
+        WriteRiscvRewrite(options.output, *program,
+                          std::move(plan.conditional_assign_locs),
+                          std::move(plan.array_lookup_locs),
+                          std::move(plan.logic_expr_locs));
+      }
       return 0;
     }
     OptimizeAst(*program);

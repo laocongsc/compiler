@@ -300,9 +300,14 @@ std::string OptimizeAsm(const std::string &asm_text) {
 
 KoopaGenerator::KoopaGenerator(std::ostream &out) : out_(out) {}
 
-KoopaGenerator::KoopaGenerator(std::ostream &out,
-                               std::unordered_set<std::string> rewrite_if_locs)
-    : out_(out), rewrite_if_locs_(std::move(rewrite_if_locs)) {}
+KoopaGenerator::KoopaGenerator(
+    std::ostream &out, std::unordered_set<std::string> rewrite_if_locs,
+    std::unordered_set<std::string> rewrite_array_lookup_locs,
+    std::unordered_set<std::string> rewrite_logic_expr_locs)
+    : out_(out),
+      rewrite_if_locs_(std::move(rewrite_if_locs)),
+      rewrite_array_lookup_locs_(std::move(rewrite_array_lookup_locs)),
+      rewrite_logic_expr_locs_(std::move(rewrite_logic_expr_locs)) {}
 
 void KoopaGenerator::Generate(const Program &program) {
   RegisterLibraryFunctions();
@@ -774,6 +779,47 @@ bool KoopaGenerator::TryGenerateRewriteIf(const BlockItem &item) {
   return true;
 }
 
+
+std::string KoopaGenerator::TryGenerateRewriteArrayLookup(const LValExpr &lval) {
+  if (rewrite_array_lookup_locs_.count(LocKey(lval.loc)) == 0) {
+    return "";
+  }
+  const Symbol &symbol = LookupSymbol(lval.name);
+  if (symbol.is_pointer || symbol.dimensions.size() != 1 || lval.indices.size() != 1) {
+    return "";
+  }
+  const int length = symbol.dimensions.front();
+  const std::string index = GenerateExpr(*lval.indices.front());
+  std::string result = "0";
+  for (int i = 0; i < length; ++i) {
+    const std::string ptr = NewValueName();
+    out_ << "  " << ptr << " = getelemptr " << symbol.ir_name << ", " << i << "\n";
+    const std::string value = NewValueName();
+    out_ << "  " << value << " = load " << ptr << "\n";
+    const std::string match = EmitBinary("eq", index, std::to_string(i));
+    const std::string mask = EmitBinary("sub", "0", match);
+    const std::string not_mask = EmitBinary("xor", mask, "-1");
+    const std::string taken = EmitBinary("and", value, mask);
+    const std::string kept = EmitBinary("and", result, not_mask);
+    result = EmitBinary("or", taken, kept);
+  }
+  return result;
+}
+
+std::string KoopaGenerator::TryGenerateRewriteLogicExpr(const BinaryExpr &expr) {
+  if (rewrite_logic_expr_locs_.count(LocKey(expr.loc)) == 0) {
+    return "";
+  }
+  if (expr.op != BinaryOp::And && expr.op != BinaryOp::Or) {
+    return "";
+  }
+  const std::string lhs = GenerateExpr(*expr.lhs);
+  const std::string rhs = GenerateExpr(*expr.rhs);
+  const std::string lhs_bool = EmitBinary("ne", lhs, "0");
+  const std::string rhs_bool = EmitBinary("ne", rhs, "0");
+  return EmitBinary(expr.op == BinaryOp::And ? "and" : "or", lhs_bool, rhs_bool);
+}
+
 void KoopaGenerator::GenerateWhile(const BlockItem &item) {
   const std::string entry_label = NewBlockName("while_entry");
   const std::string body_label = NewBlockName("while_body");
@@ -805,6 +851,9 @@ std::string KoopaGenerator::GenerateExpr(const Expr &expr) {
   }
 
   if (const auto *lval = dynamic_cast<const LValExpr *>(&expr)) {
+    if (std::string rewritten = TryGenerateRewriteArrayLookup(*lval); !rewritten.empty()) {
+      return rewritten;
+    }
     const Symbol &symbol = LookupSymbol(lval->name);
     if (symbol.kind == Symbol::Kind::Const && symbol.dimensions.empty()) {
       return std::to_string(symbol.const_value);
@@ -859,6 +908,10 @@ std::string KoopaGenerator::GenerateExpr(const Expr &expr) {
   const auto *binary = dynamic_cast<const BinaryExpr *>(&expr);
   if (binary == nullptr) {
     throw std::runtime_error("unknown expression node");
+  }
+
+  if (std::string rewritten = TryGenerateRewriteLogicExpr(*binary); !rewritten.empty()) {
+    return rewritten;
   }
 
   if (binary->op == BinaryOp::And) {
@@ -1114,6 +1167,15 @@ std::string KoopaGenerator::JoinArgs(const std::vector<std::string> &args) {
 // RISC-V backend.
 
 RiscvGenerator::RiscvGenerator(std::ostream &out) : out_(out) {}
+
+RiscvGenerator::RiscvGenerator(
+    std::ostream &out, std::unordered_set<std::string> rewrite_if_locs,
+    std::unordered_set<std::string> rewrite_array_lookup_locs,
+    std::unordered_set<std::string> rewrite_logic_expr_locs)
+    : out_(out),
+      rewrite_if_locs_(std::move(rewrite_if_locs)),
+      rewrite_array_lookup_locs_(std::move(rewrite_array_lookup_locs)),
+      rewrite_logic_expr_locs_(std::move(rewrite_logic_expr_locs)) {}
 
 void RiscvGenerator::Generate(const Program &program) {
   RegisterLibraryFunctions();
@@ -1546,6 +1608,9 @@ void RiscvGenerator::GenerateItem(const BlockItem &item) {
 }
 
 void RiscvGenerator::GenerateIf(const BlockItem &item) {
+  if (TryGenerateRewriteIf(item)) {
+    return;
+  }
   const std::string then_label = NewLabel("then");
   const std::string end_label = NewLabel("end");
   const std::string else_label = item.else_stmt ? NewLabel("else") : end_label;
@@ -1578,6 +1643,92 @@ void RiscvGenerator::GenerateIf(const BlockItem &item) {
   out_ << end_label << ":\n";
   ClearRegCache();
   current_terminated_ = false;
+}
+
+
+bool RiscvGenerator::TryGenerateRewriteIf(const BlockItem &item) {
+  if (rewrite_if_locs_.count(LocKey(item.loc)) == 0 || item.else_stmt == nullptr) {
+    return false;
+  }
+  const BlockItem *then_assign = SingleAssignItem(*item.then_stmt);
+  const BlockItem *else_assign = SingleAssignItem(*item.else_stmt);
+  if (then_assign == nullptr || else_assign == nullptr) {
+    return false;
+  }
+  const Symbol &symbol = LookupSymbol(then_assign->lval->name);
+  if (symbol.kind == Symbol::Kind::Const || !symbol.dimensions.empty() ||
+      !then_assign->lval->indices.empty() || !else_assign->lval->indices.empty() ||
+      then_assign->lval->name != else_assign->lval->name) {
+    return false;
+  }
+
+  GenerateExpr(*item.expr, 0);
+  out_ << "  snez t0, t0\n";
+  out_ << "  sub t0, x0, t0\n";
+  EmitStoreStack(out_, "t0", TempOffset(0));
+  GenerateExpr(*then_assign->expr, 1);
+  EmitStoreStack(out_, "t0", TempOffset(1));
+  GenerateExpr(*else_assign->expr, 2);
+  EmitLoadStack(out_, "t1", TempOffset(0));
+  out_ << "  xori t2, t1, -1\n";
+  out_ << "  and t0, t0, t2\n";
+  EmitLoadStack(out_, "t2", TempOffset(1));
+  out_ << "  and t2, t2, t1\n";
+  out_ << "  or t0, t2, t0\n";
+  StoreToSymbol(symbol, "t0");
+  current_terminated_ = false;
+  return true;
+}
+
+bool RiscvGenerator::TryGenerateRewriteArrayLookup(const LValExpr &lval, int depth) {
+  if (rewrite_array_lookup_locs_.count(LocKey(lval.loc)) == 0) {
+    return false;
+  }
+  const Symbol &symbol = LookupSymbol(lval.name);
+  if (symbol.is_pointer || symbol.dimensions.size() != 1 || lval.indices.size() != 1) {
+    return false;
+  }
+  const int length = symbol.dimensions.front();
+  GenerateExpr(*lval.indices.front(), depth + 2);
+  EmitStoreStack(out_, "t0", TempOffset(depth));
+  out_ << "  li t0, 0\n";
+  EmitStoreStack(out_, "t0", TempOffset(depth + 1));
+  for (int i = 0; i < length; ++i) {
+    LoadSymbolAddress(symbol, "t0");
+    out_ << "  li t1, " << (i * 4) << "\n";
+    out_ << "  add t0, t0, t1\n";
+    LoadAddressed("t0", "t0");
+    EmitLoadStack(out_, "t1", TempOffset(depth));
+    out_ << "  li t2, " << i << "\n";
+    out_ << "  xor t1, t1, t2\n";
+    out_ << "  seqz t1, t1\n";
+    out_ << "  sub t1, x0, t1\n";
+    out_ << "  and t0, t0, t1\n";
+    EmitLoadStack(out_, "t2", TempOffset(depth + 1));
+    out_ << "  xori t1, t1, -1\n";
+    out_ << "  and t2, t2, t1\n";
+    out_ << "  or t0, t0, t2\n";
+    EmitStoreStack(out_, "t0", TempOffset(depth + 1));
+  }
+  EmitLoadStack(out_, "t0", TempOffset(depth + 1));
+  return true;
+}
+
+bool RiscvGenerator::TryGenerateRewriteLogicExpr(const BinaryExpr &expr, int depth) {
+  if (rewrite_logic_expr_locs_.count(LocKey(expr.loc)) == 0) {
+    return false;
+  }
+  if (expr.op != BinaryOp::And && expr.op != BinaryOp::Or) {
+    return false;
+  }
+  GenerateExpr(*expr.lhs, depth);
+  out_ << "  snez t0, t0\n";
+  EmitStoreStack(out_, "t0", TempOffset(depth));
+  GenerateExpr(*expr.rhs, depth + 1);
+  out_ << "  snez t0, t0\n";
+  EmitLoadStack(out_, "t1", TempOffset(depth));
+  out_ << "  " << (expr.op == BinaryOp::And ? "and" : "or") << " t0, t1, t0\n";
+  return true;
 }
 
 void RiscvGenerator::GenerateWhile(const BlockItem &item) {
@@ -1627,6 +1778,9 @@ void RiscvGenerator::GenerateExpr(const Expr &expr, int depth) {
     return;
   }
   if (const auto *lval = dynamic_cast<const LValExpr *>(&expr)) {
+    if (TryGenerateRewriteArrayLookup(*lval, depth)) {
+      return;
+    }
     const Symbol &symbol = LookupSymbol(lval->name);
     if (symbol.kind == Symbol::Kind::Const && symbol.dimensions.empty()) {
       out_ << "  li t0, " << symbol.const_value << "\n";
@@ -1695,6 +1849,9 @@ void RiscvGenerator::GenerateExpr(const Expr &expr, int depth) {
   const auto *binary = dynamic_cast<const BinaryExpr *>(&expr);
   if (binary == nullptr) {
     throw std::runtime_error("unknown expression node");
+  }
+  if (TryGenerateRewriteLogicExpr(*binary, depth)) {
+    return;
   }
   if (binary->op == BinaryOp::And || binary->op == BinaryOp::Or) {
     const std::string true_label = NewLabel("logic_true");
@@ -2045,18 +2202,39 @@ void WriteKoopa(const std::string &path, const Program &program) {
 }
 
 void WriteKoopaRewrite(const std::string &path, const Program &program,
-                       std::unordered_set<std::string> rewrite_if_locs) {
+                       std::unordered_set<std::string> rewrite_if_locs,
+                       std::unordered_set<std::string> rewrite_array_lookup_locs,
+                       std::unordered_set<std::string> rewrite_logic_expr_locs) {
   std::ofstream out(path);
   if (!out) {
     throw std::runtime_error("failed to open output file: " + path);
   }
-  KoopaGenerator generator(out, std::move(rewrite_if_locs));
+  KoopaGenerator generator(out, std::move(rewrite_if_locs),
+                           std::move(rewrite_array_lookup_locs),
+                           std::move(rewrite_logic_expr_locs));
   generator.Generate(program);
 }
 
 void WriteRiscv(const std::string &path, const Program &program) {
   std::ostringstream buffer;
   RiscvGenerator generator(buffer);
+  generator.Generate(program);
+
+  std::ofstream out(path);
+  if (!out) {
+    throw std::runtime_error("failed to open output file: " + path);
+  }
+  out << OptimizeAsm(buffer.str());
+}
+
+void WriteRiscvRewrite(const std::string &path, const Program &program,
+                       std::unordered_set<std::string> rewrite_if_locs,
+                       std::unordered_set<std::string> rewrite_array_lookup_locs,
+                       std::unordered_set<std::string> rewrite_logic_expr_locs) {
+  std::ostringstream buffer;
+  RiscvGenerator generator(buffer, std::move(rewrite_if_locs),
+                           std::move(rewrite_array_lookup_locs),
+                           std::move(rewrite_logic_expr_locs));
   generator.Generate(program);
 
   std::ofstream out(path);

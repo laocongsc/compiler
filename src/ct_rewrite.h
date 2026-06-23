@@ -16,9 +16,13 @@ struct RewriteDecision {
 struct RewritePlan {
   std::vector<RewriteDecision> decisions;
   std::unordered_set<std::string> conditional_assign_locs;
+  std::unordered_set<std::string> array_lookup_locs;
+  std::unordered_set<std::string> logic_expr_locs;
 
   bool AllSupported() const;
   bool ShouldRewriteIf(SourceLocation loc) const;
+  bool ShouldRewriteArrayLookup(SourceLocation loc) const;
+  bool ShouldRewriteLogicExpr(SourceLocation loc) const;
 };
 
 RewritePlan BuildRewritePlan(const Program &program,
