@@ -37,6 +37,8 @@ struct ArrayTaint {
 struct LeakSymbol {
   TaintInfo taint;
   bool is_array = false;
+  bool declared_secret = false;
+  TaintInfo declared_secret_taint;
   std::string alias_to;
   ArrayTaint array_taint;
 };
@@ -106,10 +108,17 @@ TaintInfo SecretTaint(std::string reason, SourceLocation loc, std::string subjec
   return taint;
 }
 
-LeakSymbol MakeSymbol(TaintInfo taint, bool is_array) {
+LeakSymbol MakeSymbol(TaintInfo taint, bool is_array, bool declared_secret = false,
+                      TaintInfo declared_secret_taint = TaintInfo{}) {
   LeakSymbol symbol;
   symbol.taint = std::move(taint);
   symbol.is_array = is_array;
+  symbol.declared_secret = declared_secret;
+  symbol.declared_secret_taint = std::move(declared_secret_taint);
+  if (declared_secret && is_array && symbol.declared_secret_taint.level == SecLevel::Secret) {
+    symbol.array_taint.whole_array_secret = true;
+    symbol.array_taint.whole_array_reason = symbol.declared_secret_taint;
+  }
   return symbol;
 }
 
@@ -282,7 +291,10 @@ class LeakDetector {
     PushScope();
     for (size_t i = 0; i < function.params.size(); ++i) {
       const Param &param = function.params[i];
-      InsertSymbol(param.name, MakeSymbol(InitialTaint(param.name, param.loc), param.is_array));
+      const bool declared_secret = param.is_secret || IsSecretName(param.name);
+      TaintInfo declared_taint = InitialTaint(param.name, param.loc, param.is_secret);
+      InsertSymbol(param.name, MakeSymbol(declared_taint, param.is_array,
+                                          declared_secret, declared_taint));
       if (static_cast<int>(i) == secret_param) {
         AssignSymbolTaint(param.name, SecretTaint(param.name + " is secret because it is the selected summary parameter at " + LocString(param.loc), param.loc, param.name));
       }
@@ -313,7 +325,13 @@ class LeakDetector {
     }
   }
 
-  TaintInfo InitialTaint(const std::string &name, SourceLocation loc) const {
+  TaintInfo InitialTaint(const std::string &name, SourceLocation loc,
+                         bool explicit_secret = false) const {
+    if (explicit_secret) {
+      return SecretTaint(name + " is secret because it is declared secret at " +
+                             LocString(loc),
+                         loc, name);
+    }
     if (IsSecretName(name)) {
       return SecretTaint(name + " is secret because its name starts with secret_ at " + LocString(loc), loc, name);
     }
@@ -372,31 +390,50 @@ class LeakDetector {
 
   void AssignSymbolTaint(const std::string &name, TaintInfo taint) {
     const std::string resolved = ResolveAlias(name);
-    if (IsSecretName(resolved)) {
-      taint = Join(InitialTaint(resolved, taint.loc), taint);
-    }
     if (LeakSymbol *symbol = FindSymbol(resolved)) {
+      if (symbol->declared_secret) {
+        if (IsSecret(taint.level) && !taint.reason.empty()) {
+          TaintInfo combined = symbol->declared_secret_taint;
+          combined.reason += "; " + taint.reason;
+          combined.subject = resolved;
+          combined.loc = symbol->declared_secret_taint.loc;
+          taint = std::move(combined);
+        } else {
+          taint = Join(symbol->declared_secret_taint, taint);
+        }
+      } else if (IsSecretName(resolved)) {
+        taint = Join(InitialTaint(resolved, taint.loc), taint);
+      }
       symbol->taint = std::move(taint);
-      if (!IsSecret(symbol->taint.level)) {
+      if (!symbol->declared_secret && !IsSecret(symbol->taint.level)) {
         symbol->array_taint.whole_array_secret = false;
         symbol->array_taint.element_taint.clear();
       }
       return;
     }
-    InsertSymbol(resolved, MakeSymbol(std::move(taint), false));
+    const bool declared_secret = IsSecretName(resolved);
+    TaintInfo declared_taint = InitialTaint(resolved, taint.loc);
+    if (declared_secret) {
+      taint = Join(declared_taint, taint);
+    }
+    InsertSymbol(resolved, MakeSymbol(std::move(taint), false, declared_secret,
+                                      std::move(declared_taint)));
   }
 
   void SetArrayElementTaint(const std::string &name, int index, TaintInfo taint) {
     const std::string resolved = ResolveAlias(name);
     LeakSymbol *symbol = FindSymbol(resolved);
     if (symbol == nullptr) {
-      InsertSymbol(resolved, MakeSymbol(PublicTaint(taint.loc, resolved), true));
+      const bool declared_secret = IsSecretName(resolved);
+      TaintInfo declared_taint = InitialTaint(resolved, taint.loc);
+      InsertSymbol(resolved, MakeSymbol(PublicTaint(taint.loc, resolved), true,
+                                        declared_secret, std::move(declared_taint)));
       symbol = FindSymbol(resolved);
     }
     symbol->is_array = true;
     if (IsSecret(taint.level)) {
       symbol->array_taint.element_taint[index] = std::move(taint);
-    } else {
+    } else if (!symbol->declared_secret) {
       symbol->array_taint.element_taint.erase(index);
     }
   }
@@ -405,7 +442,10 @@ class LeakDetector {
     const std::string resolved = ResolveAlias(name);
     LeakSymbol *symbol = FindSymbol(resolved);
     if (symbol == nullptr) {
-      InsertSymbol(resolved, MakeSymbol(PublicTaint(taint.loc, resolved), true));
+      const bool declared_secret = IsSecretName(resolved);
+      TaintInfo declared_taint = InitialTaint(resolved, taint.loc);
+      InsertSymbol(resolved, MakeSymbol(PublicTaint(taint.loc, resolved), true,
+                                        declared_secret, std::move(declared_taint)));
       symbol = FindSymbol(resolved);
     }
     symbol->is_array = true;
@@ -438,11 +478,14 @@ class LeakDetector {
     PushScope();
     for (size_t i = 0; i < function.params.size(); ++i) {
       const Param &param = function.params[i];
-      TaintInfo taint = InitialTaint(param.name, param.loc);
+      const bool declared_secret = param.is_secret || IsSecretName(param.name);
+      TaintInfo declared_taint = InitialTaint(param.name, param.loc, param.is_secret);
+      TaintInfo taint = declared_taint;
       if (param_override != nullptr && i < param_override->size()) {
         taint = Join(taint, (*param_override)[i]);
       }
-      InsertSymbol(param.name, MakeSymbol(taint, param.is_array));
+      InsertSymbol(param.name, MakeSymbol(taint, param.is_array, declared_secret,
+                                          declared_taint));
       for (const auto &dimension : param.dimensions) {
         AnalyzeExpr(*dimension);
       }
@@ -540,10 +583,12 @@ class LeakDetector {
       for (const auto &dimension : def.dimensions) {
         AnalyzeExpr(*dimension);
       }
-      TaintInfo taint = InitialTaint(def.name, def.loc);
-      taint = Join(taint, AnalyzeInit(def.init));
+      const bool declared_secret = def.is_secret || IsSecretName(def.name);
+      TaintInfo declared_taint = InitialTaint(def.name, def.loc, def.is_secret);
+      TaintInfo taint = Join(declared_taint, AnalyzeInit(def.init));
       taint = Join(taint, control_taint_);
-      InsertSymbol(def.name, MakeSymbol(taint, !def.dimensions.empty()));
+      InsertSymbol(def.name, MakeSymbol(taint, !def.dimensions.empty(),
+                                        declared_secret, declared_taint));
       if (!def.dimensions.empty() && IsSecret(taint.level)) {
         SetArrayWholeTaint(def.name, taint);
       }
@@ -555,11 +600,17 @@ class LeakDetector {
       for (const auto &dimension : def.dimensions) {
         AnalyzeExpr(*dimension);
       }
-      TaintInfo taint = InitialTaint(def.name, def.loc);
+      const bool declared_secret = def.is_secret || IsSecretName(def.name);
+      TaintInfo declared_taint = InitialTaint(def.name, def.loc, def.is_secret);
+      TaintInfo taint = declared_taint;
       if (def.has_init) {
         TaintInfo init = AnalyzeInit(def.init);
         if (IsSecret(init.level) && !IsSecret(taint.level)) {
+          std::string source_reason = init.reason;
           init.reason = def.name + " is secret because it was assigned from " + init.subject + " at " + LocString(def.loc);
+          if (!source_reason.empty()) {
+            init.reason += "; " + source_reason;
+          }
           init.subject = def.name;
           init.loc = def.loc;
         }
@@ -568,7 +619,8 @@ class LeakDetector {
       if (IsSecret(control_taint_.level) && !IsSecret(taint.level)) {
         taint = SecretTaint(def.name + " is secret because it was assigned under secret control at " + LocString(def.loc), def.loc, def.name);
       }
-      InsertSymbol(def.name, MakeSymbol(taint, !def.dimensions.empty()));
+      InsertSymbol(def.name, MakeSymbol(taint, !def.dimensions.empty(),
+                                        declared_secret, declared_taint));
       if (!def.dimensions.empty() && IsSecret(taint.level)) {
         SetArrayWholeTaint(def.name, taint);
       }
@@ -668,6 +720,16 @@ class LeakDetector {
     ExprTaint lhs = AnalyzeExpr(*binary->lhs);
     ExprTaint rhs = AnalyzeExpr(*binary->rhs);
     ExprTaint result = IsSecret(lhs.level) ? lhs : rhs;
+    if (IsSecret(lhs.level) && IsSecret(rhs.level)) {
+      result.subject = lhs.subject + " and " + rhs.subject;
+      result.reason = lhs.reason;
+      if (!rhs.reason.empty()) {
+        if (!result.reason.empty()) {
+          result.reason += "; ";
+        }
+        result.reason += rhs.reason;
+      }
+    }
     result.loc = expr.loc;
     if (!IsSecret(result.level)) {
       result.subject = "expression";
@@ -747,8 +809,10 @@ class LeakDetector {
     }
     if (secret_return) {
       const std::string subject = CallSubject(call, arg_taints);
+      const std::string source = secret_arg.subject.empty() ?
+                                     "declared secret" : secret_arg.subject;
       return ExprTaint{SecLevel::Secret,
-                       subject + " is secret because it depends on " + secret_arg.subject + " at " + LocString(call.loc),
+                       subject + " is secret because it depends on " + source + " at " + LocString(call.loc),
                        call.loc, subject};
     }
     return ExprTaint{SecLevel::Public, "", call.loc, CallSubject(call, arg_taints)};
@@ -765,12 +829,15 @@ class LeakDetector {
     PushScope();
     for (size_t i = 0; i < function.params.size(); ++i) {
       const Param &param = function.params[i];
-      TaintInfo taint = InitialTaint(param.name, param.loc);
-      LeakSymbol symbol = MakeSymbol(taint, param.is_array);
+      const bool declared_secret = param.is_secret || IsSecretName(param.name);
+      TaintInfo declared_taint = InitialTaint(param.name, param.loc, param.is_secret);
+      TaintInfo taint = declared_taint;
+      LeakSymbol symbol = MakeSymbol(taint, param.is_array, declared_secret,
+                                     declared_taint);
       if (i < arg_taints.size()) {
         taint = Join(taint, ToTaint(arg_taints[i]));
         symbol.taint = taint;
-        if (param.is_array) {
+        if (param.is_array && !symbol.declared_secret) {
           if (const auto *actual = dynamic_cast<const LValExpr *>(call.args[i].get())) {
             if (actual->indices.empty()) {
               symbol.alias_to = ResolveAlias(actual->name);
@@ -792,7 +859,11 @@ class LeakDetector {
     runtime_call_stack_.erase(function.name);
     if (IsSecret(result.level)) {
       const std::string subject = CallSubject(call, arg_taints);
+      const std::string source_reason = result.reason;
       result.reason = subject + " is secret because it depends on " + result.subject + " at " + LocString(call.loc);
+      if (!source_reason.empty()) {
+        result.reason += "; " + source_reason;
+      }
       result.subject = subject;
       result.loc = call.loc;
     } else {

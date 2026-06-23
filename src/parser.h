@@ -26,7 +26,9 @@ class Parser {
   BlockItem ParseBlockItem();
   BlockItem ParseConstDecl();
   BlockItem ParseVarDecl(bool type_consumed = false,
-                         std::string first_name = "");
+                         std::string first_name = "",
+                         bool is_secret = false,
+                         SourceLocation first_loc = SourceLocation{});
   BlockItem ParseStmt();
   std::vector<std::unique_ptr<Expr>> ParseDimensions();
   std::unique_ptr<LValExpr> ParseLVal();

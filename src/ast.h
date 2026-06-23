@@ -51,12 +51,14 @@ struct InitVal {
 struct ConstDef {
   std::string name;
   SourceLocation loc;
+  bool is_secret = false;
   std::vector<std::unique_ptr<Expr>> dimensions;
   InitVal init;
 };
 struct VarDef {
   std::string name;
   SourceLocation loc;
+  bool is_secret = false;
   std::vector<std::unique_ptr<Expr>> dimensions;
   bool has_init = false;
   InitVal init;
@@ -64,6 +66,7 @@ struct VarDef {
 struct Param {
   std::string name;
   SourceLocation loc;
+  bool is_secret = false;
   bool is_array = false;
   std::vector<std::unique_ptr<Expr>> dimensions;
 };

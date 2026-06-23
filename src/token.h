@@ -14,6 +14,7 @@ enum class TokenKind {
   While,
   Break,
   Continue,
+  Secret,
   Int,
   Void,
   Return,

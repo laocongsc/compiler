@@ -112,6 +112,9 @@ Token Lexer::ReadIdentOrKeyword() {
   if (text == "continue") {
     return {TokenKind::Continue, text, 0, loc};
   }
+  if (text == "secret") {
+    return {TokenKind::Secret, text, 0, loc};
+  }
   if (text == "int") {
     return {TokenKind::Int, text, 0, loc};
   }

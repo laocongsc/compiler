@@ -33,6 +33,20 @@ GlobalItem Parser::ParseGlobalItem() {
     item.const_defs = std::move(decl.const_defs);
     return item;
   }
+  if (Peek().kind == TokenKind::Secret) {
+    Match(TokenKind::Secret);
+    Expect(TokenKind::Int, "'int'");
+    const Token name_token = Expect(TokenKind::Ident, "identifier");
+    if (Peek().kind == TokenKind::LParen) {
+      throw std::runtime_error("secret return type is not supported");
+    }
+    BlockItem decl = ParseVarDecl(true, name_token.text, true, name_token.loc);
+    GlobalItem item;
+    item.loc = decl.loc;
+    item.kind = GlobalItem::Kind::VarDecl;
+    item.var_defs = std::move(decl.var_defs);
+    return item;
+  }
   return ParseTopLevelDeclOrFunc();
 }
 
@@ -51,7 +65,7 @@ GlobalItem Parser::ParseTopLevelDeclOrFunc() {
   if (type != TypeKind::Int) {
     throw std::runtime_error("global variable must have int type");
   }
-  BlockItem decl = ParseVarDecl(true, name);
+  BlockItem decl = ParseVarDecl(true, name, false, name_token.loc);
   GlobalItem item;
   item.loc = decl.loc;
   item.kind = GlobalItem::Kind::VarDecl;
@@ -83,11 +97,13 @@ std::vector<Param> Parser::ParseFuncFParams() {
 }
 
 Param Parser::ParseFuncFParam() {
+  const bool is_secret = Match(TokenKind::Secret);
   Expect(TokenKind::Int, "'int'");
   Param param;
   const Token name_token = Expect(TokenKind::Ident, "parameter name");
   param.name = name_token.text;
   param.loc = name_token.loc;
+  param.is_secret = is_secret;
   if (Match(TokenKind::LBracket)) {
     param.is_array = true;
     Expect(TokenKind::RBracket, "']'");
@@ -123,7 +139,7 @@ BlockItem Parser::ParseBlockItem() {
   if (Peek().kind == TokenKind::Const) {
     return ParseConstDecl();
   }
-  if (Peek().kind == TokenKind::Int) {
+  if (Peek().kind == TokenKind::Int || Peek().kind == TokenKind::Secret) {
     return ParseVarDecl();
   }
   return ParseStmt();
@@ -134,12 +150,14 @@ BlockItem Parser::ParseConstDecl() {
   item.kind = BlockItem::Kind::ConstDecl;
   const Token const_token = Expect(TokenKind::Const, "'const'");
   item.loc = const_token.loc;
+  const bool is_secret = Match(TokenKind::Secret);
   Expect(TokenKind::Int, "'int'");
   while (true) {
     ConstDef def;
     const Token name_token = Expect(TokenKind::Ident, "constant name");
     def.name = name_token.text;
     def.loc = name_token.loc;
+    def.is_secret = is_secret;
     def.dimensions = ParseDimensions();
     Expect(TokenKind::Assign, "'='");
     def.init = ParseInitVal();
@@ -152,10 +170,12 @@ BlockItem Parser::ParseConstDecl() {
   return item;
 }
 
-BlockItem Parser::ParseVarDecl(bool type_consumed, std::string first_name) {
+BlockItem Parser::ParseVarDecl(bool type_consumed, std::string first_name,
+                               bool is_secret, SourceLocation first_loc) {
   BlockItem item;
   item.kind = BlockItem::Kind::VarDecl;
   if (!type_consumed) {
+    is_secret = Match(TokenKind::Secret);
     const Token int_token = Expect(TokenKind::Int, "'int'");
     item.loc = int_token.loc;
   }
@@ -164,7 +184,8 @@ BlockItem Parser::ParseVarDecl(bool type_consumed, std::string first_name) {
     VarDef def;
     if (first && !first_name.empty()) {
       def.name = std::move(first_name);
-      def.loc = item.loc;
+      def.loc = first_loc;
+      item.loc = first_loc;
     } else {
       const Token name_token = Expect(TokenKind::Ident, "variable name");
       def.name = name_token.text;
@@ -173,6 +194,7 @@ BlockItem Parser::ParseVarDecl(bool type_consumed, std::string first_name) {
         item.loc = name_token.loc;
       }
     }
+    def.is_secret = is_secret;
     first = false;
     def.dimensions = ParseDimensions();
     if (Match(TokenKind::Assign)) {
