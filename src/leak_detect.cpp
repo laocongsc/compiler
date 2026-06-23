@@ -1,6 +1,7 @@
 #include "leak_detect.h"
 
 #include <cstddef>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -12,8 +13,22 @@ namespace {
 
 enum class SecLevel { Public, Secret };
 
-struct LeakSymbol {
+struct TaintInfo {
   SecLevel level = SecLevel::Public;
+  std::string reason;
+  SourceLocation loc;
+  std::string subject;
+};
+
+struct ExprTaint {
+  SecLevel level = SecLevel::Public;
+  std::string reason;
+  SourceLocation loc;
+  std::string subject;
+};
+
+struct LeakSymbol {
+  TaintInfo taint;
   bool is_array = false;
 };
 
@@ -27,22 +42,12 @@ struct FunctionSummary {
   TypeKind return_type = TypeKind::Int;
   bool returns_secret_by_default = false;
   std::vector<bool> return_depends_on_param;
-  bool has_secret_dependent_control = false;
-  bool writes_secret_to_global = false;
   bool conservative = false;
 };
 
 struct AnalysisOptions {
   bool collect_reports = true;
-  bool use_summaries = true;
-  bool collect_return_level = false;
 };
-
-SecLevel Join(SecLevel lhs, SecLevel rhs) {
-  return lhs == SecLevel::Secret || rhs == SecLevel::Secret
-             ? SecLevel::Secret
-             : SecLevel::Public;
-}
 
 bool IsSecret(SecLevel level) { return level == SecLevel::Secret; }
 
@@ -50,11 +55,62 @@ bool IsSecretName(const std::string &name) {
   return name.rfind("secret_", 0) == 0;
 }
 
+std::string LocString(SourceLocation loc) {
+  return std::to_string(loc.line) + ":" + std::to_string(loc.column);
+}
+
+TaintInfo PublicTaint(SourceLocation loc = SourceLocation{}, std::string subject = "") {
+  TaintInfo taint;
+  taint.loc = loc;
+  taint.subject = std::move(subject);
+  return taint;
+}
+
+TaintInfo SecretTaint(std::string reason, SourceLocation loc, std::string subject) {
+  TaintInfo taint;
+  taint.level = SecLevel::Secret;
+  taint.reason = std::move(reason);
+  taint.loc = loc;
+  taint.subject = std::move(subject);
+  return taint;
+}
+
+TaintInfo Join(TaintInfo lhs, const TaintInfo &rhs) {
+  if (IsSecret(lhs.level)) {
+    return lhs;
+  }
+  if (IsSecret(rhs.level)) {
+    return rhs;
+  }
+  return lhs;
+}
+
+ExprTaint ToExpr(TaintInfo taint) {
+  return ExprTaint{taint.level, taint.reason, taint.loc, taint.subject};
+}
+
+TaintInfo ToTaint(const ExprTaint &taint) {
+  return TaintInfo{taint.level, taint.reason, taint.loc, taint.subject};
+}
+
+std::string CallSubject(const CallExpr &call, const std::vector<ExprTaint> &args) {
+  std::string text = call.name + "(";
+  for (size_t i = 0; i < args.size(); ++i) {
+    if (i != 0) {
+      text += ", ";
+    }
+    text += args[i].subject.empty() ? "?" : args[i].subject;
+  }
+  text += ")";
+  return text;
+}
+
 class LeakDetector {
  public:
   std::vector<LeakReport> Detect(const Program &program) {
     program_ = &program;
     reports_.clear();
+    warning_keys_.clear();
     functions_.clear();
     summaries_.clear();
     function_defs_.clear();
@@ -66,7 +122,7 @@ class LeakDetector {
     options_ = AnalysisOptions{};
     scopes_.clear();
     globals_.clear();
-    control_level_ = SecLevel::Public;
+    control_taint_ = PublicTaint();
     current_function_ = "<global>";
 
     PushScope();
@@ -107,15 +163,11 @@ class LeakDetector {
   void BuildFunctionSummaries(const Program &program) {
     const AnalysisOptions saved_options = options_;
     options_.collect_reports = false;
-    options_.use_summaries = true;
-    options_.collect_return_level = true;
-
     for (const GlobalItem &item : program.items) {
       if (item.kind == GlobalItem::Kind::FuncDef) {
         EnsureSummary(item.function->name);
       }
     }
-
     options_ = saved_options;
   }
 
@@ -124,39 +176,35 @@ class LeakDetector {
     if (existing != summaries_.end()) {
       return existing->second;
     }
-
-    const auto function_found = function_defs_.find(name);
-    if (function_found == function_defs_.end()) {
+    const auto found = function_defs_.find(name);
+    if (found == function_defs_.end()) {
       return ConservativeSummary(name);
     }
-
     if (analysis_stack_.count(name) != 0) {
-      FunctionSummary recursive = MakeConservativeSummary(*function_found->second);
-      summaries_[name] = recursive;
+      FunctionSummary summary = MakeConservativeSummary(*found->second);
+      summaries_[name] = summary;
       return summaries_.at(name);
     }
 
     analysis_stack_.insert(name);
-    const FunctionDef &function = *function_found->second;
+    const FunctionDef &function = *found->second;
     FunctionSummary summary;
     summary.return_type = function.return_type;
     summary.return_depends_on_param.assign(function.params.size(), false);
-
-    summary.returns_secret_by_default = IsSecret(AnalyzeFunctionReturn(function, -1));
+    summary.returns_secret_by_default = IsSecret(AnalyzeFunctionReturn(function, -1).level);
     for (size_t i = 0; i < function.params.size(); ++i) {
       summary.return_depends_on_param[i] =
-          IsSecret(AnalyzeFunctionReturn(function, static_cast<int>(i)));
+          IsSecret(AnalyzeFunctionReturn(function, static_cast<int>(i)).level);
     }
-
     analysis_stack_.erase(name);
     summaries_[name] = summary;
     return summaries_.at(name);
   }
 
   const FunctionSummary &ConservativeSummary(const std::string &name) {
-    const auto found = summaries_.find(name);
-    if (found != summaries_.end()) {
-      return found->second;
+    const auto existing = summaries_.find(name);
+    if (existing != summaries_.end()) {
+      return existing->second;
     }
     FunctionSummary summary;
     const auto info = functions_.find(name);
@@ -177,17 +225,17 @@ class LeakDetector {
     return summary;
   }
 
-  SecLevel AnalyzeFunctionReturn(const FunctionDef &function, int secret_param) {
+  TaintInfo AnalyzeFunctionReturn(const FunctionDef &function, int secret_param) {
     const auto saved_scopes = scopes_;
     const auto saved_globals = globals_;
     const std::string saved_function = current_function_;
-    const SecLevel saved_control = control_level_;
-    const SecLevel saved_return = return_level_;
+    const TaintInfo saved_control = control_taint_;
+    const TaintInfo saved_return = return_taint_;
 
     scopes_.clear();
     globals_.clear();
-    control_level_ = SecLevel::Public;
-    return_level_ = SecLevel::Public;
+    control_taint_ = PublicTaint();
+    return_taint_ = PublicTaint(function.loc, function.name);
     current_function_ = function.name;
     PushScope();
     if (program_ != nullptr) {
@@ -196,11 +244,10 @@ class LeakDetector {
     PushScope();
     for (size_t i = 0; i < function.params.size(); ++i) {
       const Param &param = function.params[i];
-      SecLevel level = IsSecretName(param.name) ? SecLevel::Secret : SecLevel::Public;
+      InsertSymbol(param.name, LeakSymbol{InitialTaint(param.name, param.loc), param.is_array});
       if (static_cast<int>(i) == secret_param) {
-        level = SecLevel::Secret;
+        SetSymbolTaint(param.name, SecretTaint(param.name + " is secret because it is the selected summary parameter at " + LocString(param.loc), param.loc, param.name));
       }
-      InsertSymbol(param.name, LeakSymbol{level, param.is_array});
       for (const auto &dimension : param.dimensions) {
         AnalyzeExpr(*dimension);
       }
@@ -209,12 +256,12 @@ class LeakDetector {
     PopScope();
     PopScope();
 
-    const SecLevel result = return_level_;
+    const TaintInfo result = return_taint_;
     scopes_ = saved_scopes;
     globals_ = saved_globals;
     current_function_ = saved_function;
-    control_level_ = saved_control;
-    return_level_ = saved_return;
+    control_taint_ = saved_control;
+    return_taint_ = saved_return;
     return result;
   }
 
@@ -228,12 +275,18 @@ class LeakDetector {
     }
   }
 
-  void PushScope() { scopes_.emplace_back(); }
+  TaintInfo InitialTaint(const std::string &name, SourceLocation loc) const {
+    if (IsSecretName(name)) {
+      return SecretTaint(name + " is secret because its name starts with secret_ at " + LocString(loc), loc, name);
+    }
+    return PublicTaint(loc, name);
+  }
 
+  void PushScope() { scopes_.emplace_back(); }
   void PopScope() { scopes_.pop_back(); }
 
   void InsertSymbol(const std::string &name, LeakSymbol symbol) {
-    scopes_.back()[name] = symbol;
+    scopes_.back()[name] = std::move(symbol);
     if (scopes_.size() == 1) {
       globals_.insert(name);
     }
@@ -246,46 +299,51 @@ class LeakDetector {
         return found->second;
       }
     }
-    return LeakSymbol{IsSecretName(name) ? SecLevel::Secret : SecLevel::Public,
-                      false};
+    return LeakSymbol{InitialTaint(name, SourceLocation{}), false};
   }
 
-  void SetSymbolLevel(const std::string &name, SecLevel level) {
-    const SecLevel combined = Join(NameLevel(name), level);
+  void SetSymbolTaint(const std::string &name, TaintInfo taint) {
+    if (IsSecretName(name)) {
+      taint = Join(InitialTaint(name, taint.loc), taint);
+    }
     for (auto it = scopes_.rbegin(); it != scopes_.rend(); ++it) {
       const auto found = it->find(name);
       if (found != it->end()) {
-        const SecLevel previous = found->second.level;
-        found->second.level = Join(found->second.level, combined);
-        if (globals_.count(name) != 0 && IsSecret(found->second.level) &&
-            !IsSecret(previous)) {
-          active_summary_writes_secret_global_ = true;
-        }
+        found->second.taint = Join(found->second.taint, taint);
         return;
       }
     }
-    InsertSymbol(name, LeakSymbol{combined, false});
+    InsertSymbol(name, LeakSymbol{std::move(taint), false});
   }
 
-  void Report(const std::string &kind, const std::string &message) {
+  void Report(LeakKind kind, Severity severity, SourceLocation loc,
+              const std::string &subject, const std::string &message,
+              const std::string &reason = "") {
     if (!options_.collect_reports) {
       return;
     }
-    reports_.push_back(LeakReport{kind, current_function_, message});
+    std::ostringstream key;
+    key << static_cast<int>(kind) << '|' << current_function_ << '|' << loc.line
+        << '|' << loc.column << '|' << subject;
+    if (!warning_keys_.insert(key.str()).second) {
+      return;
+    }
+    reports_.push_back(LeakReport{kind, severity, current_function_, loc,
+                                  subject, message, reason});
   }
 
   void AnalyzeFunction(const FunctionDef &function,
-                       const std::vector<SecLevel> *param_override) {
+                       const std::vector<TaintInfo> *param_override) {
     const std::string previous_function = current_function_;
     current_function_ = function.name;
     PushScope();
     for (size_t i = 0; i < function.params.size(); ++i) {
       const Param &param = function.params[i];
-      SecLevel level = IsSecretName(param.name) ? SecLevel::Secret : SecLevel::Public;
+      TaintInfo taint = InitialTaint(param.name, param.loc);
       if (param_override != nullptr && i < param_override->size()) {
-        level = (*param_override)[i];
+        taint = Join(taint, (*param_override)[i]);
       }
-      InsertSymbol(param.name, LeakSymbol{level, param.is_array});
+      InsertSymbol(param.name, LeakSymbol{taint, param.is_array});
       for (const auto &dimension : param.dimensions) {
         AnalyzeExpr(*dimension);
       }
@@ -312,12 +370,12 @@ class LeakDetector {
         AnalyzeVarDecl(item.var_defs);
         break;
       case BlockItem::Kind::Assign:
-        AnalyzeAssign(*item.lval, *item.expr);
+        AnalyzeAssign(*item.lval, *item.expr, item.loc);
         break;
       case BlockItem::Kind::Return:
         if (item.expr) {
-          const SecLevel value = AnalyzeExpr(*item.expr);
-          return_level_ = Join(return_level_, Join(value, control_level_));
+          const ExprTaint value = AnalyzeExpr(*item.expr);
+          return_taint_ = Join(return_taint_, Join(ToTaint(value), control_taint_));
         }
         break;
       case BlockItem::Kind::ExprStmt:
@@ -329,56 +387,53 @@ class LeakDetector {
         AnalyzeBlock(*item.block);
         break;
       case BlockItem::Kind::If: {
-        const SecLevel condition = AnalyzeExpr(*item.expr);
-        if (IsSecret(condition)) {
-          Report("secret-dependent branch", "if condition depends on secret data");
-          active_summary_has_secret_control_ = true;
+        const ExprTaint condition = AnalyzeExpr(*item.expr);
+        if (IsSecret(condition.level)) {
+          Report(LeakKind::SecretBranch, Severity::Medium, item.loc, "if",
+                 "condition uses " + condition.subject, condition.reason);
         }
-        WithControl(Join(control_level_, condition), [&]() {
+        WithControl(Join(control_taint_, ToTaint(condition)), [&]() {
           AnalyzeItem(*item.then_stmt);
         });
         if (item.else_stmt) {
-          WithControl(Join(control_level_, condition), [&]() {
+          WithControl(Join(control_taint_, ToTaint(condition)), [&]() {
             AnalyzeItem(*item.else_stmt);
           });
         }
         break;
       }
       case BlockItem::Kind::While: {
-        const SecLevel condition = AnalyzeExpr(*item.expr);
-        if (IsSecret(condition)) {
-          Report("secret-dependent loop bound",
-                 "while condition depends on secret data");
-          active_summary_has_secret_control_ = true;
+        const ExprTaint condition = AnalyzeExpr(*item.expr);
+        if (IsSecret(condition.level)) {
+          Report(LeakKind::SecretLoopBound, Severity::Medium, item.loc, "while",
+                 "while condition uses " + condition.subject, condition.reason);
         }
-        WithControl(Join(control_level_, condition), [&]() {
+        WithControl(Join(control_taint_, ToTaint(condition)), [&]() {
           AnalyzeItem(*item.body_stmt);
         });
         break;
       }
       case BlockItem::Kind::Break:
-        if (IsSecret(control_level_)) {
-          Report("secret-dependent break",
-                 "break executes under secret control");
-          active_summary_has_secret_control_ = true;
+        if (IsSecret(control_taint_.level)) {
+          Report(LeakKind::SecretBreak, Severity::Medium, item.loc, "break",
+                 "break executes under secret control", control_taint_.reason);
         }
         break;
       case BlockItem::Kind::Continue:
-        if (IsSecret(control_level_)) {
-          Report("secret-dependent continue",
-                 "continue executes under secret control");
-          active_summary_has_secret_control_ = true;
+        if (IsSecret(control_taint_.level)) {
+          Report(LeakKind::SecretContinue, Severity::Medium, item.loc, "continue",
+                 "continue executes under secret control", control_taint_.reason);
         }
         break;
     }
   }
 
   template <typename Fn>
-  void WithControl(SecLevel level, Fn fn) {
-    const SecLevel saved = control_level_;
-    control_level_ = level;
+  void WithControl(TaintInfo taint, Fn fn) {
+    const TaintInfo saved = control_taint_;
+    control_taint_ = taint;
     fn();
-    control_level_ = saved;
+    control_taint_ = saved;
   }
 
   void AnalyzeConstDecl(const std::vector<ConstDef> &defs) {
@@ -386,11 +441,10 @@ class LeakDetector {
       for (const auto &dimension : def.dimensions) {
         AnalyzeExpr(*dimension);
       }
-      const SecLevel init_level = AnalyzeInit(def.init);
-      InsertSymbol(def.name,
-                   LeakSymbol{Join(Join(NameLevel(def.name), init_level),
-                                   control_level_),
-                              !def.dimensions.empty()});
+      TaintInfo taint = InitialTaint(def.name, def.loc);
+      taint = Join(taint, AnalyzeInit(def.init));
+      taint = Join(taint, control_taint_);
+      InsertSymbol(def.name, LeakSymbol{taint, !def.dimensions.empty()});
     }
   }
 
@@ -399,54 +453,71 @@ class LeakDetector {
       for (const auto &dimension : def.dimensions) {
         AnalyzeExpr(*dimension);
       }
-      SecLevel level = Join(NameLevel(def.name), control_level_);
+      TaintInfo taint = InitialTaint(def.name, def.loc);
       if (def.has_init) {
-        level = Join(level, AnalyzeInit(def.init));
+        TaintInfo init = AnalyzeInit(def.init);
+        if (IsSecret(init.level) && !IsSecret(taint.level)) {
+          init.reason = def.name + " is secret because it was assigned from " + init.subject + " at " + LocString(def.loc);
+          init.subject = def.name;
+          init.loc = def.loc;
+        }
+        taint = Join(taint, init);
       }
-      InsertSymbol(def.name, LeakSymbol{level, !def.dimensions.empty()});
+      if (IsSecret(control_taint_.level) && !IsSecret(taint.level)) {
+        taint = SecretTaint(def.name + " is secret because it was assigned under secret control at " + LocString(def.loc), def.loc, def.name);
+      }
+      InsertSymbol(def.name, LeakSymbol{taint, !def.dimensions.empty()});
     }
   }
 
-  SecLevel AnalyzeInit(const InitVal &init) {
+  TaintInfo AnalyzeInit(const InitVal &init) {
     if (!init.is_list) {
-      return init.expr ? AnalyzeExpr(*init.expr) : SecLevel::Public;
+      return init.expr ? ToTaint(AnalyzeExpr(*init.expr)) : PublicTaint();
     }
-    SecLevel level = SecLevel::Public;
+    TaintInfo taint = PublicTaint();
     for (const InitVal &child : init.list) {
-      level = Join(level, AnalyzeInit(child));
+      taint = Join(taint, AnalyzeInit(child));
     }
-    return level;
+    return taint;
   }
 
-  void AnalyzeAssign(const LValExpr &lval, const Expr &rhs) {
-    const SecLevel rhs_level = AnalyzeExpr(rhs);
-    const bool secret_index = AnalyzeLValIndices(lval);
-    if (secret_index) {
-      Report("secret-dependent array index",
-             "write to " + lval.name + " uses a secret index");
+  void AnalyzeAssign(const LValExpr &lval, const Expr &rhs, SourceLocation loc) {
+    const ExprTaint rhs_taint = AnalyzeExpr(rhs);
+    const ExprTaint index_taint = AnalyzeLValIndices(lval);
+    if (IsSecret(index_taint.level)) {
+      Report(LeakKind::SecretArrayIndex, Severity::High, lval.loc, lval.name,
+             "write to " + lval.name + " uses a secret index", index_taint.reason);
     }
-    const SecLevel assigned_level = Join(rhs_level, control_level_);
+    TaintInfo assigned = Join(ToTaint(rhs_taint), control_taint_);
     if (lval.indices.empty()) {
-      SetSymbolLevel(lval.name, assigned_level);
+      if (IsSecret(control_taint_.level)) {
+        assigned = SecretTaint(lval.name + " is secret because it was assigned under secret control at " + LocString(loc), loc, lval.name);
+      } else if (IsSecret(rhs_taint.level)) {
+        assigned.reason = lval.name + " is secret because it was assigned from " + rhs_taint.subject + " at " + LocString(loc);
+        assigned.subject = lval.name;
+        assigned.loc = loc;
+      }
+      SetSymbolTaint(lval.name, assigned);
       return;
     }
-    if (IsSecret(assigned_level)) {
-      SetSymbolLevel(lval.name, SecLevel::Secret);
+    if (IsSecret(assigned.level)) {
+      SetSymbolTaint(lval.name, SecretTaint(lval.name + " is secret because a secret value was written into one of its elements at " + LocString(loc), loc, lval.name));
     }
   }
 
-  SecLevel AnalyzeExpr(const Expr &expr) {
-    if (dynamic_cast<const NumberExpr *>(&expr) != nullptr) {
-      return SecLevel::Public;
+  ExprTaint AnalyzeExpr(const Expr &expr) {
+    if (const auto *number = dynamic_cast<const NumberExpr *>(&expr)) {
+      (void)number;
+      return ExprTaint{SecLevel::Public, "", expr.loc, "constant"};
     }
 
     if (const auto *lval = dynamic_cast<const LValExpr *>(&expr)) {
-      const bool secret_index = AnalyzeLValIndices(*lval);
-      if (secret_index) {
-        Report("secret-dependent array index",
-               "read from " + lval->name + " uses a secret index");
+      const ExprTaint index_taint = AnalyzeLValIndices(*lval);
+      if (IsSecret(index_taint.level)) {
+        Report(LeakKind::SecretArrayIndex, Severity::High, lval->loc, lval->name,
+               "read from " + lval->name + " uses a secret index", index_taint.reason);
       }
-      return LookupSymbol(lval->name).level;
+      return ToExpr(LookupSymbol(lval->name).taint);
     }
 
     if (const auto *call = dynamic_cast<const CallExpr *>(&expr)) {
@@ -454,7 +525,9 @@ class LeakDetector {
     }
 
     if (const auto *unary = dynamic_cast<const UnaryExpr *>(&expr)) {
-      return AnalyzeExpr(*unary->operand);
+      ExprTaint operand = AnalyzeExpr(*unary->operand);
+      operand.loc = expr.loc;
+      return operand;
     }
 
     const auto *binary = dynamic_cast<const BinaryExpr *>(&expr);
@@ -462,100 +535,111 @@ class LeakDetector {
       throw std::runtime_error("unknown expression node in leak detector");
     }
 
-    const SecLevel lhs = AnalyzeExpr(*binary->lhs);
-    const SecLevel rhs = AnalyzeExpr(*binary->rhs);
-    if ((binary->op == BinaryOp::And || binary->op == BinaryOp::Or) &&
-        (IsSecret(lhs) || IsSecret(rhs))) {
-      Report("secret-dependent short-circuit",
-             "logical operator depends on secret data");
-      active_summary_has_secret_control_ = true;
+    ExprTaint lhs = AnalyzeExpr(*binary->lhs);
+    ExprTaint rhs = AnalyzeExpr(*binary->rhs);
+    ExprTaint result = IsSecret(lhs.level) ? lhs : rhs;
+    result.loc = expr.loc;
+    if (!IsSecret(result.level)) {
+      result.subject = "expression";
     }
-    return Join(lhs, rhs);
+    if ((binary->op == BinaryOp::And || binary->op == BinaryOp::Or) &&
+        (IsSecret(lhs.level) || IsSecret(rhs.level))) {
+      const std::string op = binary->op == BinaryOp::And ? "&&" : "||";
+      Report(LeakKind::SecretShortCircuit, Severity::Medium, expr.loc, op,
+             "logical operator " + op + " depends on secret data", result.reason);
+    }
+    return result;
   }
 
-  SecLevel AnalyzeCall(const CallExpr &call) {
-    std::vector<SecLevel> arg_levels;
-    arg_levels.reserve(call.args.size());
+  ExprTaint AnalyzeCall(const CallExpr &call) {
+    std::vector<ExprTaint> arg_taints;
+    arg_taints.reserve(call.args.size());
     bool has_secret_arg = false;
+    TaintInfo secret_arg;
     for (const auto &arg : call.args) {
-      const SecLevel arg_level = AnalyzeExpr(*arg);
-      arg_levels.push_back(arg_level);
-      has_secret_arg = has_secret_arg || IsSecret(arg_level);
+      ExprTaint arg_taint = AnalyzeExpr(*arg);
+      arg_taints.push_back(arg_taint);
+      if (IsSecret(arg_taint.level) && !has_secret_arg) {
+        has_secret_arg = true;
+        secret_arg = ToTaint(arg_taint);
+      }
     }
 
     if (IsOutputFunction(call.name)) {
       if (has_secret_arg) {
-        Report("secret-dependent observable call",
-               call.name + " observes secret data");
+        Report(LeakKind::SecretObservableCall, Severity::High, call.loc, call.name,
+               call.name + " observes secret data", secret_arg.reason);
       }
-      if (IsSecret(control_level_)) {
-        Report("secret-dependent observable call",
-               call.name + " executes under secret control");
+      if (IsSecret(control_taint_.level)) {
+        Report(LeakKind::SecretObservableCall, Severity::Medium, call.loc, call.name,
+               call.name + " executes under secret control", control_taint_.reason);
       }
-      return SecLevel::Public;
+      return ExprTaint{SecLevel::Public, "", call.loc, call.name};
     }
 
     if (IsTimingFunction(call.name)) {
-      if (IsSecret(control_level_)) {
-        Report("secret-dependent timing call",
-               call.name + " executes under secret control");
+      if (IsSecret(control_taint_.level)) {
+        Report(LeakKind::SecretTimingCall, Severity::Medium, call.loc, call.name,
+               call.name + " executes under secret control", control_taint_.reason);
       }
-      return SecLevel::Public;
+      return ExprTaint{SecLevel::Public, "", call.loc, call.name};
     }
 
     if (IsInputFunction(call.name)) {
-      return SecLevel::Public;
+      return ExprTaint{SecLevel::Public, "", call.loc, call.name + "()"};
     }
 
     const auto user_function = function_defs_.find(call.name);
     if (user_function != function_defs_.end() && options_.collect_reports &&
         runtime_call_stack_.count(call.name) == 0) {
-      return AnalyzeUserFunctionCall(*user_function->second, arg_levels);
-    }
-
-    const auto found = functions_.find(call.name);
-    if (found != functions_.end() && found->second.return_type == TypeKind::Void) {
-      (void)EnsureSummaryIfUserFunction(call.name);
-      return SecLevel::Public;
+      return AnalyzeUserFunctionCall(*user_function->second, call, arg_taints);
     }
 
     const FunctionSummary *summary = EnsureSummaryIfUserFunction(call.name);
     if (summary == nullptr || summary->conservative) {
-      SecLevel level = SecLevel::Public;
-      for (SecLevel arg_level : arg_levels) {
-        level = Join(level, arg_level);
+      if (has_secret_arg) {
+        TaintInfo taint = secret_arg;
+        taint.reason = CallSubject(call, arg_taints) + " is secret because it was called with " + secret_arg.subject + " at " + LocString(call.loc);
+        taint.subject = CallSubject(call, arg_taints);
+        taint.loc = call.loc;
+        return ToExpr(taint);
       }
-      return level;
+      return ExprTaint{SecLevel::Public, "", call.loc, CallSubject(call, arg_taints)};
     }
 
-    SecLevel result = summary->returns_secret_by_default ? SecLevel::Secret
-                                                         : SecLevel::Public;
-    for (size_t i = 0; i < arg_levels.size() &&
-                       i < summary->return_depends_on_param.size();
-         ++i) {
-      if (IsSecret(arg_levels[i]) && summary->return_depends_on_param[i]) {
-        result = SecLevel::Secret;
+    bool secret_return = summary->returns_secret_by_default;
+    for (size_t i = 0; i < arg_taints.size() && i < summary->return_depends_on_param.size(); ++i) {
+      if (IsSecret(arg_taints[i].level) && summary->return_depends_on_param[i]) {
+        secret_return = true;
+        secret_arg = ToTaint(arg_taints[i]);
+        break;
       }
     }
-    return result;
+    if (secret_return) {
+      const std::string subject = CallSubject(call, arg_taints);
+      return ExprTaint{SecLevel::Secret,
+                       subject + " is secret because it depends on " + secret_arg.subject + " at " + LocString(call.loc),
+                       call.loc, subject};
+    }
+    return ExprTaint{SecLevel::Public, "", call.loc, CallSubject(call, arg_taints)};
   }
 
-  SecLevel AnalyzeUserFunctionCall(const FunctionDef &function,
-                                   const std::vector<SecLevel> &arg_levels) {
+  ExprTaint AnalyzeUserFunctionCall(const FunctionDef &function, const CallExpr &call,
+                                    const std::vector<ExprTaint> &arg_taints) {
     runtime_call_stack_.insert(function.name);
     const std::string saved_function = current_function_;
-    const SecLevel saved_return = return_level_;
+    const TaintInfo saved_return = return_taint_;
 
     current_function_ = function.name;
-    return_level_ = SecLevel::Public;
+    return_taint_ = PublicTaint(function.loc, function.name);
     PushScope();
     for (size_t i = 0; i < function.params.size(); ++i) {
       const Param &param = function.params[i];
-      SecLevel level = IsSecretName(param.name) ? SecLevel::Secret : SecLevel::Public;
-      if (i < arg_levels.size()) {
-        level = Join(level, arg_levels[i]);
+      TaintInfo taint = InitialTaint(param.name, param.loc);
+      if (i < arg_taints.size()) {
+        taint = Join(taint, ToTaint(arg_taints[i]));
       }
-      InsertSymbol(param.name, LeakSymbol{level, param.is_array});
+      InsertSymbol(param.name, LeakSymbol{taint, param.is_array});
       for (const auto &dimension : param.dimensions) {
         AnalyzeExpr(*dimension);
       }
@@ -563,41 +647,47 @@ class LeakDetector {
     AnalyzeBlock(*function.block);
     PopScope();
 
-    const SecLevel result = return_level_;
-    return_level_ = saved_return;
+    TaintInfo result = return_taint_;
+    return_taint_ = saved_return;
     current_function_ = saved_function;
     runtime_call_stack_.erase(function.name);
-    return result;
+    if (IsSecret(result.level)) {
+      const std::string subject = CallSubject(call, arg_taints);
+      result.reason = subject + " is secret because it depends on " + result.subject + " at " + LocString(call.loc);
+      result.subject = subject;
+      result.loc = call.loc;
+    } else {
+      result.subject = CallSubject(call, arg_taints);
+      result.loc = call.loc;
+    }
+    return ToExpr(result);
   }
 
   const FunctionSummary *EnsureSummaryIfUserFunction(const std::string &name) {
-    const auto function_found = function_defs_.find(name);
-    if (function_found == function_defs_.end()) {
+    const auto found = function_defs_.find(name);
+    if (found == function_defs_.end()) {
       return nullptr;
     }
     return &EnsureSummary(name);
   }
 
-  bool AnalyzeLValIndices(const LValExpr &lval) {
-    bool secret_index = false;
+  ExprTaint AnalyzeLValIndices(const LValExpr &lval) {
+    ExprTaint result{SecLevel::Public, "", lval.loc, lval.name};
     for (const auto &index : lval.indices) {
-      secret_index = secret_index || IsSecret(AnalyzeExpr(*index));
+      ExprTaint index_taint = AnalyzeExpr(*index);
+      if (IsSecret(index_taint.level)) {
+        return index_taint;
+      }
     }
-    return secret_index;
-  }
-
-  static SecLevel NameLevel(const std::string &name) {
-    return IsSecretName(name) ? SecLevel::Secret : SecLevel::Public;
+    return result;
   }
 
   static bool IsInputFunction(const std::string &name) {
     return name == "getint" || name == "getch" || name == "getarray";
   }
-
   static bool IsOutputFunction(const std::string &name) {
     return name == "putint" || name == "putch" || name == "putarray";
   }
-
   static bool IsTimingFunction(const std::string &name) {
     return name == "starttime" || name == "stoptime";
   }
@@ -611,15 +701,37 @@ class LeakDetector {
   std::unordered_map<std::string, FunctionSummary> summaries_;
   std::unordered_set<std::string> analysis_stack_;
   std::unordered_set<std::string> runtime_call_stack_;
+  std::unordered_set<std::string> warning_keys_;
   std::vector<LeakReport> reports_;
   std::string current_function_ = "<global>";
-  SecLevel control_level_ = SecLevel::Public;
-  SecLevel return_level_ = SecLevel::Public;
-  bool active_summary_has_secret_control_ = false;
-  bool active_summary_writes_secret_global_ = false;
+  TaintInfo control_taint_;
+  TaintInfo return_taint_;
 };
 
 }  // namespace
+
+std::string LeakKindName(LeakKind kind) {
+  switch (kind) {
+    case LeakKind::SecretBranch: return "secret-dependent branch";
+    case LeakKind::SecretLoopBound: return "secret-dependent loop bound";
+    case LeakKind::SecretBreak: return "secret-dependent break";
+    case LeakKind::SecretContinue: return "secret-dependent continue";
+    case LeakKind::SecretArrayIndex: return "secret-dependent array index";
+    case LeakKind::SecretShortCircuit: return "secret-dependent short-circuit";
+    case LeakKind::SecretObservableCall: return "secret-dependent observable call";
+    case LeakKind::SecretTimingCall: return "secret-dependent timing call";
+  }
+  return "unknown";
+}
+
+std::string SeverityName(Severity severity) {
+  switch (severity) {
+    case Severity::High: return "high";
+    case Severity::Medium: return "medium";
+    case Severity::Info: return "info";
+  }
+  return "unknown";
+}
 
 std::vector<LeakReport> DetectSideChannelLeaks(const Program &program) {
   LeakDetector detector;

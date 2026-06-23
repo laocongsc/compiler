@@ -2,6 +2,11 @@
 
 #include <string>
 
+struct SourceLocation {
+  int line = 1;
+  int column = 1;
+};
+
 enum class TokenKind {
   Const,
   If,
@@ -44,4 +49,5 @@ struct Token {
   TokenKind kind;
   std::string text;
   int value = 0;
+  SourceLocation loc;
 };

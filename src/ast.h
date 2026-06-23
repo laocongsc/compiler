@@ -4,6 +4,8 @@
 #include <string>
 #include <vector>
 
+#include "token.h"
+
 enum class TypeKind { Int, Void };
 
 enum class UnaryOp { Plus, Minus, Not };
@@ -14,7 +16,7 @@ enum class BinaryOp {
   And, Or,
 };
 
-struct Expr { virtual ~Expr() = default; };
+struct Expr { SourceLocation loc; virtual ~Expr() = default; };
 
 struct NumberExpr final : Expr { explicit NumberExpr(int value) : value(value) {} int value; };
 struct LValExpr final : Expr {
@@ -48,17 +50,20 @@ struct InitVal {
 
 struct ConstDef {
   std::string name;
+  SourceLocation loc;
   std::vector<std::unique_ptr<Expr>> dimensions;
   InitVal init;
 };
 struct VarDef {
   std::string name;
+  SourceLocation loc;
   std::vector<std::unique_ptr<Expr>> dimensions;
   bool has_init = false;
   InitVal init;
 };
 struct Param {
   std::string name;
+  SourceLocation loc;
   bool is_array = false;
   std::vector<std::unique_ptr<Expr>> dimensions;
 };
@@ -66,6 +71,7 @@ struct Param {
 struct Block;
 struct BlockItem {
   enum class Kind { ConstDecl, VarDecl, Assign, Return, ExprStmt, Block, If, While, Break, Continue } kind;
+  SourceLocation loc;
   std::vector<ConstDef> const_defs;
   std::vector<VarDef> var_defs;
   std::unique_ptr<LValExpr> lval;
@@ -80,12 +86,14 @@ struct Block { std::vector<BlockItem> items; };
 struct FunctionDef {
   TypeKind return_type = TypeKind::Int;
   std::string name;
+  SourceLocation loc;
   std::vector<Param> params;
   std::unique_ptr<Block> block;
 };
 
 struct GlobalItem {
   enum class Kind { ConstDecl, VarDecl, FuncDef } kind;
+  SourceLocation loc;
   std::vector<ConstDef> const_defs;
   std::vector<VarDef> var_defs;
   std::unique_ptr<FunctionDef> function;

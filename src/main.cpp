@@ -70,10 +70,18 @@ int main(int argc, char **argv) {
         throw std::runtime_error("failed to open output file: " + options.output);
       }
       for (const LeakReport &leak : leaks) {
-        const std::string line = "warning: " + leak.kind + " in function " +
-                                 leak.function + ": " + leak.message;
-        out << line << '\n';
-        std::cerr << line << '\n';
+        std::ostringstream line;
+        line << "warning[" << SeverityName(leak.severity) << "]: "
+             << LeakKindName(leak.kind) << " in function " << leak.function
+             << " at " << leak.loc.line << ':' << leak.loc.column << ": "
+             << leak.message;
+        out << line.str() << '\n';
+        std::cerr << line.str() << '\n';
+        if (!leak.reason.empty()) {
+          const std::string reason = "  reason: " + leak.reason;
+          out << reason << '\n';
+          std::cerr << reason << '\n';
+        }
       }
       return 0;
     }

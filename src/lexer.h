@@ -15,6 +15,8 @@ class Lexer {
   static bool IsIdentStart(char ch);
   static bool IsIdentPart(char ch);
 
+  char Advance();
+  SourceLocation CurrentLocation() const;
   void SkipWhitespaceAndComments();
   Token ReadIdentOrKeyword();
   Token ReadNumber();
@@ -22,4 +24,6 @@ class Lexer {
 
   std::string input_;
   size_t pos_ = 0;
+  int line_ = 1;
+  int column_ = 1;
 };
